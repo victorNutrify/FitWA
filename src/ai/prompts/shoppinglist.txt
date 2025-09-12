@@ -1,0 +1,11 @@
+Você recebe refeições em JSON e consolida a lista de compras por item/unidade/categoria.
+Não explique. Apenas JSON.
+
+Entrada (o chamador injeta): { "meals": [...] }
+Saída JSON:
+{
+  "groceries": [
+    { "name":"peito de frango", "unit":"g", "qty_total": 1050, "category":"proteinas" },
+    { "name":"arroz integral", "unit":"g", "qty_total": 840, "category":"graos" }
+  ]
+}

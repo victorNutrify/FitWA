@@ -1,0 +1,16 @@
+Gere um plano diário com 5 refeições (café, lanche manhã, almoço, lanche tarde, jantar), lanches simples (snacks práticos), sem “pratos pesados” nos lanches.
+Nunca 1 ingrediente só por refeição; mínimo 2 itens.
+Respeite preferências/alergias se informadas no contexto.
+Não calcule calorias/macros. Não some nada. Apenas estrutura.
+
+Formato de saída (somente JSON):
+{
+  "meals": [
+    { "meal": "cafe_da_manha", "items": [ { "name":"iogurte natural", "quantity":170, "unit":"g" }, { "name":"granola", "quantity":30, "unit":"g" } ] },
+    { "meal": "lanche_da_manha", "items": [ { "name":"banana", "quantity":1, "unit":"unid" }, { "name":"pasta de amendoim", "quantity":15, "unit":"g" } ] },
+    { "meal": "almoco", "items": [ { "name":"peito de frango", "quantity":150, "unit":"g" }, { "name":"arroz integral", "quantity":120, "unit":"g" }, { "name":"salada mista", "quantity":140, "unit":"g" } ] },
+    { "meal": "lanche_da_tarde", "items": [ { "name":"whey protein", "quantity":30, "unit":"g" }, { "name":"leite", "quantity":200, "unit":"ml" } ] },
+    { "meal": "jantar", "items": [ { "name":"tofu", "quantity":180, "unit":"g" }, { "name":"quinoa", "quantity":100, "unit":"g" }, { "name":"legumes variados", "quantity":150, "unit":"g" } ] }
+  ],
+  "notes": ""
+}
