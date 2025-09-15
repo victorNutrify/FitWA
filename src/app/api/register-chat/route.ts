@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, doc, setDoc, getDocs, collection, runTransaction, deleteDoc } from "@/lib/firestore.admin.compat";
 import fs from "fs";
 import path from "path";
+import { getAuth } from "firebase-admin/auth";
+import { FOOD_SYSTEM_PROMPT } from "@/ai/prompts/foodLogger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic"; // opcional, evita cache
@@ -1048,7 +1050,9 @@ function buildOpenAIMessages({
         content: [
           {
             type: "text",
-            text: "Analise a imagem de alimentos e identifique todos os itens e porções. Responda EXCLUSIVAMENTE em JSON conforme instruções do sistema.",
+            text:
+              "Analise a imagem de alimentos e identifique todos os itens e porções. " +
+              "Responda EXCLUSIVAMENTE em JSON conforme instruções do sistema.",
           },
           {
             type: "image_url",
@@ -1167,9 +1171,30 @@ function getLastRelevantMessages(messages: any[], n = 3) {
   return filtered.slice(-n * 2);
 }
 
-// --------- POST handler -----------
+async function extractUserEmailFromRequest(
+  req: NextRequest,
+  fallbackEmail?: string | null
+): Promise<string | null> {
+  const authHeader =
+    req.headers.get("authorization") || req.headers.get("Authorization");
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7).trim();
+    try {
+      const decoded = await getAuth().verifyIdToken(token);
+      if (decoded?.email) return decoded.email;
+    } catch (e) {
+      console.error("[AUTH] Falha ao verificar ID token do Firebase:", e);
+      // cai para fallback
+    }
+  }
+
+  return fallbackEmail ?? null;
+}
+
 export async function POST(req: NextRequest) {
   try {
+    // 1) Lê corpo (JSON ou multipart) normalmente
     let body: any = {};
     let isMultipart = false;
 
@@ -1200,28 +1225,73 @@ export async function POST(req: NextRequest) {
       body = await req.json();
     }
 
-    const { messages, userEmail, imageBase64 } = body;
+    const { messages, imageBase64 } = body;
 
+    // 2) Resolve userEmail prioritariamente pelo ID token Firebase
+    let userEmail: string | null = null;
+
+    // 2a) Lê Authorization: Bearer <token>
+    const authHeader =
+      req.headers.get("authorization") || req.headers.get("Authorization") || "";
+    const idToken =
+      authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
+
+    if (idToken) {
+      try {
+        // Tenta verificar token via firebase-admin/auth
+        const { getAuth } = await import("firebase-admin/auth");
+        const decoded = await getAuth().verifyIdToken(idToken);
+        userEmail = decoded?.email ?? null;
+      } catch (err) {
+        console.warn(
+          "[AUTH] Falha ao verificar ID token com firebase-admin/auth. " +
+            "Prosseguindo com fallback body.userEmail, se houver.",
+          err
+        );
+      }
+    }
+
+    // 2b) Fallback p/ body.userEmail (ex.: scripts de teste)
+    if (!userEmail && typeof body.userEmail === "string" && body.userEmail.includes("@")) {
+      userEmail = body.userEmail;
+    }
+
+    // 2c) Se ainda não temos e-mail, não dá pra salvar nada com segurança
+    if (!userEmail) {
+      console.error(
+        "[AUTH] Requisição sem usuário autenticado. Nenhum alimento/exercício será salvo."
+      );
+      return NextResponse.json(
+        {
+          error:
+            "Usuário não autenticado. Inclua Authorization: Bearer <ID_TOKEN> ou envie userEmail no body para ambiente de testes.",
+        },
+        { status: 401 }
+      );
+    }
+
+    // 3) Chave da OpenAI
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       return NextResponse.json({ error: "API key missing." }, { status: 500 });
     }
 
+    // 4) Extrai último input do usuário (texto) — útil p/ diaPadrao
     let userInput = "";
     if (Array.isArray(messages) && messages.length) {
       const last = messages[messages.length - 1]?.content;
       if (typeof last === "string") userInput = last;
-      else if (last && typeof last?.text === "string") userInput = last.text;
+      else if (last && typeof (last as any)?.text === "string") userInput = (last as any).text;
     }
 
-    // Monta mensagens para OpenAI
+    // 5) Monta mensagens p/ OpenAI (usa helpers já existentes no seu arquivo)
     const openAIMessages = buildOpenAIMessages({
       systemPrompt,
       messages: getLastRelevantMessages(messages, 3),
       imageBase64,
     });
 
-    // Chama OpenAI Chat Completions (modo JSON estrito)
+    // 6) Chama OpenAI (json strict)
     let data: any = null;
     try {
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -1268,11 +1338,11 @@ export async function POST(req: NextRequest) {
       console.log("[IMAGE] Resposta crua da LLM:", String(replyRaw).slice(0, 200) + "...");
     }
 
-    // Tenta converter a resposta em objeto JSON "macros"
+    // 7) Interpreta JSON (usa seu parseMacros existente)
     const macros = await parseMacros(replyRaw);
     const diaHoje = getDiaAtual();
 
-    // Garante sempre um "reply" amigável
+    // 8) Garante reply amigável
     if (!macros.reply && replyRaw) {
       macros.reply = replyRaw;
     } else if (!macros.reply && !replyRaw) {
@@ -1281,48 +1351,60 @@ export async function POST(req: NextRequest) {
         : "Entendido! Registrei seus alimentos.";
     }
 
-        // ----- Ações no Firestore com base no JSON interpretado -----
+    // 9) Executa ações no Firestore
     let multiMatchMsg: string | null = null;
 
-    // Usado apenas para adicionar (o DIA vem do texto do usuário);
-    // para excluir/substituir usamos sempre o "diaHoje"
     const diaPadraoParaAdicionar = String(
       userInput || (macros as any).diaPadrao || (macros as any).dia || ""
     );
 
-    if (Array.isArray(macros.alimentos) && macros.alimentos.length && userEmail) {
-      await adicionarAlimentosFirestore(userEmail, macros.alimentos, diaPadraoParaAdicionar);
+    try {
+      if (Array.isArray(macros.alimentos) && macros.alimentos.length) {
+        await adicionarAlimentosFirestore(userEmail, macros.alimentos, diaPadraoParaAdicionar);
+      } else {
+        if (Array.isArray(macros.alimentos)) {
+          console.log(
+            "[SAVE] Nenhum alimento para adicionar. Itens:", macros.alimentos.length
+          );
+        }
+      }
+
+      if (Array.isArray(macros.alimentos_a_subtrair) && macros.alimentos_a_subtrair.length) {
+        await excluirAlimentosFirestore(userEmail, macros.alimentos_a_subtrair, diaHoje);
+      }
+
+      if (Array.isArray(macros.alimentos_a_excluir) && macros.alimentos_a_excluir.length) {
+        await excluirAlimentosFirestore(userEmail, macros.alimentos_a_excluir, diaHoje);
+      }
+
+      if (Array.isArray(macros.alimentos_a_substituir) && macros.alimentos_a_substituir.length) {
+        multiMatchMsg = await substituirAlimentosFirestore(
+          userEmail,
+          macros.alimentos_a_substituir,
+          diaHoje
+        );
+      }
+
+      if (Array.isArray(macros.exercicios) && macros.exercicios.length) {
+        await adicionarExerciciosFirestore(userEmail, macros.exercicios, diaHoje);
+      }
+
+      if (Array.isArray(macros.exercicios_a_excluir) && macros.exercicios_a_excluir.length) {
+        await excluirExerciciosFirestore(userEmail, macros.exercicios_a_excluir, diaHoje);
+      }
+
+      if (Array.isArray(macros.exercicios_a_subtrair) && macros.exercicios_a_subtrair.length) {
+        await excluirParcialExerciciosFirestore(userEmail, macros.exercicios_a_subtrair, diaHoje);
+      }
+
+      if (Array.isArray(macros.exercicios_a_substituir) && macros.exercicios_a_substituir.length) {
+        await substituirExerciciosFirestore(userEmail, macros.exercicios_a_substituir, diaHoje);
+      }
+    } catch (saveErr) {
+      console.error("[SAVE] Falha durante operações de persistência:", saveErr);
     }
 
-    if (Array.isArray(macros.alimentos_a_subtrair) && macros.alimentos_a_subtrair.length && userEmail) {
-      await excluirAlimentosFirestore(userEmail, macros.alimentos_a_subtrair, diaHoje);
-    }
-
-    if (Array.isArray(macros.alimentos_a_excluir) && macros.alimentos_a_excluir.length && userEmail) {
-      await excluirAlimentosFirestore(userEmail, macros.alimentos_a_excluir, diaHoje);
-    }
-
-    if (Array.isArray(macros.alimentos_a_substituir) && macros.alimentos_a_substituir.length && userEmail) {
-      multiMatchMsg = await substituirAlimentosFirestore(userEmail, macros.alimentos_a_substituir, diaHoje);
-    }
-
-    if (Array.isArray(macros.exercicios) && macros.exercicios.length && userEmail) {
-      await adicionarExerciciosFirestore(userEmail, macros.exercicios, diaHoje);
-    }
-
-    if (Array.isArray(macros.exercicios_a_excluir) && macros.exercicios_a_excluir.length && userEmail) {
-      await excluirExerciciosFirestore(userEmail, macros.exercicios_a_excluir, diaHoje);
-    }
-
-    if (Array.isArray(macros.exercicios_a_subtrair) && macros.exercicios_a_subtrair.length && userEmail) {
-      await excluirParcialExerciciosFirestore(userEmail, macros.exercicios_a_subtrair, diaHoje);
-    }
-
-    if (Array.isArray(macros.exercicios_a_substituir) && macros.exercicios_a_substituir.length && userEmail) {
-      await substituirExerciciosFirestore(userEmail, macros.exercicios_a_substituir, diaHoje);
-    }
-
-    // Caso de ambiguidade na substituição
+    // 10) Se houve ambiguidade em substituição
     if (multiMatchMsg) {
       return NextResponse.json(
         {
@@ -1338,7 +1420,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Resposta padrão OK
+    // 11) Resposta OK
     return NextResponse.json({
       reply: macros.reply || replyRaw,
       alimentos_lancados:
@@ -1378,6 +1460,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-
-
-
