@@ -3,17 +3,19 @@ export type AgentDomain = "food" | "exercise" | "diet" | "recipes" | "shopping" 
 
 export interface AgentContext {
   userEmail: string;
-  hasImage?: boolean;       // se a mensagem veio com imagem
-  nowISO?: string;          // data/hora atual (ISO -03:00 opcional)
-  locale?: string;          // "pt-BR" por padrão
+  hasImage?: boolean;
+  imageBase64?: string;   // <- adicionado para o agente de comidas usar a imagem
+  nowISO?: string;
+  locale?: string;
 }
 
 export interface AgentResult {
   domain: AgentDomain;
-  reply?: string; // resposta amigável ao usuário (opcional nesta fase)
-  data?: any;     // payload estruturado (o agente específico preenche)
+  reply?: string;
+  data?: any;
 }
 
+// Opcional (usado em outras variantes). Mantido aqui para compatibilidade.
 export type LLMCaller = (opts: {
   system?: string;
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
@@ -22,3 +24,5 @@ export type LLMCaller = (opts: {
   temperature?: number;
   max_tokens?: number;
 }) => Promise<{ content: string }>;
+
+

@@ -1065,103 +1065,17 @@ function buildOpenAIMessages({
   return [{ role: "system", content: systemPrompt }, ...messages];
 }
 
-const systemPrompt = `
-Você é um assistente de saúde, nutrição e atividade física. 
-SEMPRE responda **EXCLUSIVAMENTE** em **JSON** (um único objeto).
-
-### Campos esperados no objeto JSON:
-- "reply": string curta e direta explicando ao usuário o que foi entendido/registrado.
-- "alimentos": array de objetos para LANÇAR alimentos.
-- "alimentos_a_excluir": array de objetos para EXCLUIR alimentos inteiros (remoção total).
-- "alimentos_a_subtrair": array de objetos para REMOVER PARCIALMENTE (ex: "remover 100g de arroz").
-- "alimentos_a_substituir": array de objetos no formato { "de": {...}, "para": {...} }.
-- "exercicios": array de objetos para LANÇAR exercícios (opcional).
-- "exercicios_a_excluir": array para EXCLUIR exercícios.
-- "exercicios_a_subtrair": array para REMOVER PARCIALMENTE exercícios (reduzir duração/calorias).
-- "exercicios_a_substituir": array no formato { "de": {...}, "para": {...} }.
-
-### Formato dos itens de "alimentos" (para lançar):
-Cada item deve conter:
-- "nome": string (ex: "Banana", "Arroz cozido", "Pão de forma")
-- "quantidade": string (um destes formatos)
-    * "120g" / "500g" / "1kg"
-    * "200ml" / "1l"
-    * "2 unidades" / "1 unidade" / "3 fatias" / "1 colher"
-- "porcaoUnitaria": number (em gramas) **apenas** quando a quantidade for em UNIDADES (inclui "fatia", "colher", etc.).
-  Exemplos de porcaoUnitaria: pão de forma (25), ovo (50), sushi (30), bife (120), colher de geleia (15).
-- Opcionalmente:
-  * "refeicao": string (ex: "café da manhã", "lanche da manhã", "almoço", "lanche da tarde", "jantar", "ceia")
-  * "horario": string "HH:MM" **ou** ISO "YYYY-MM-DDTHH:MM:SS-03:00" (se souber)
-  * "calorias", "proteina", "carboidrato", "gordura": números (por porção informada). Se não souber, deixe de fora.
-  * "fonteMacros": string curta (ex: "estimativa", "rótulo", "tabela").
-
-### Regras importantes:
-1) **NÃO repita** alimentos já citados na mesma mensagem do usuário.
-2) Se o usuário pedir para **excluir**, use "alimentos_a_excluir".
-3) Se o usuário pedir para **remover parte** de um item ("saldo"), use "alimentos_a_subtrair".
-4) Se o usuário disser "não é X, é Y" ou similar, use "alimentos_a_substituir" com:
-   { "de": { "nome": "X", ... }, "para": { "nome": "Y", ... } }.
-5) Para "fatia/unidade/colher", **SEMPRE** inclua "porcaoUnitaria" correta (em gramas), quando possível:
-   - Pão de forma (fatia): 25
-   - Ovo: 50
-   - Sushi (peça): 30
-   - Bife: 120
-   - Colher de geleia/doce: 15
-   - Prato de salada verde (1 prato): 100
-6) Não invente datas. Você **pode** incluir "refeicao" e "horario" (HH:MM) se o usuário mencionar, senão omita.
-7) Foque nos alimentos e quantidades; seja objetivo no "reply".
-
-### Exemplos:
-
-// Lançar simples em unidades
-{
-  "reply": "Registrei 2 ovos e 100g de arroz.",
-  "alimentos": [
-    { "nome": "Ovo", "quantidade": "2 unidades", "porcaoUnitaria": 50 },
-    { "nome": "Arroz", "quantidade": "100g" }
-  ]
+function buildFoodMessages(
+  messages: any[],
+  imageBase64?: string
+) {
+  // Usa o prompt oficial do arquivo de prompts
+  return buildOpenAIMessages({
+    systemPrompt: FOOD_SYSTEM_PROMPT,
+    messages: getLastRelevantMessages(messages, 3),
+    imageBase64,
+  });
 }
-
-// Lançar com fatias
-{
-  "reply": "Registrei 2 fatias de pão de forma (50g no total).",
-  "alimentos": [
-    { "nome": "Pão de forma", "quantidade": "2 fatias", "porcaoUnitaria": 25 }
-  ]
-}
-
-// Exclusão parcial ("saldo")
-{
-  "reply": "Removi 130g de laranja.",
-  "alimentos_a_subtrair": [
-    { "nome": "Laranja", "quantidade": "130g" }
-  ]
-}
-
-// Exclusão total
-{
-  "reply": "Alimento farofa removido.",
-  "alimentos_a_excluir": [
-    { "nome": "Farofa" }
-  ]
-}
-
-// Substituição
-{
-  "reply": "Substituí 50g de farofa por 500g de arroz.",
-  "alimentos_a_substituir": [
-    { "de": { "nome": "Farofa", "quantidade": "50g" }, "para": { "nome": "Arroz", "quantidade": "500g" } }
-  ]
-}
-
-// Exercícios (opcional)
-{
-  "reply": "Adicionei 30min de corrida leve (200 kcal).",
-  "exercicios": [
-    { "tipo": "Corrida leve", "duracao": "30min", "calorias": 200 }
-  ]
-}
-`.trim();
 
 function getLastRelevantMessages(messages: any[], n = 3) {
   // Mantém apenas últimas trocas user/assistant para dar contexto sem poluir
@@ -1284,12 +1198,8 @@ export async function POST(req: NextRequest) {
       else if (last && typeof (last as any)?.text === "string") userInput = (last as any).text;
     }
 
-    // 5) Monta mensagens p/ OpenAI (usa helpers já existentes no seu arquivo)
-    const openAIMessages = buildOpenAIMessages({
-      systemPrompt,
-      messages: getLastRelevantMessages(messages, 3),
-      imageBase64,
-    });
+    // 5) Monta mensagens p/ OpenAI **usando o prompt oficial**
+    const openAIMessages = buildFoodMessages(messages, imageBase64);
 
     // 6) Chama OpenAI (json strict)
     let data: any = null;
@@ -1338,7 +1248,7 @@ export async function POST(req: NextRequest) {
       console.log("[IMAGE] Resposta crua da LLM:", String(replyRaw).slice(0, 200) + "...");
     }
 
-    // 7) Interpreta JSON (usa seu parseMacros existente)
+    // 7) Interpreta JSON
     const macros = await parseMacros(replyRaw);
     const diaHoje = getDiaAtual();
 
