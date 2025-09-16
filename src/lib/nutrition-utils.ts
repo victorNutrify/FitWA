@@ -58,18 +58,26 @@ export function alimentoDocId(nomeNorm: string, unidadeCanon: string) {
   return `${nomeId}__${uniId}`;
 }
 
-export function evalNumber(val: any) {
+// src/lib/nutrition-utils.ts
+export function evalNumber(val: any): number {
   if (typeof val === "number") return val;
   if (typeof val === "string") {
-    const clean = val.replace(/,/g, ".").replace(/\s+/g, "");
-    if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean);
-    if (/^[\d\.\+\-\*\/\(\)]+$/.test(clean)) {
-      try { return Function(`"use strict";return (${clean})`)(); } catch { return 0; }
+    // normaliza vírgula para ponto e remove espaços
+    const clean = val.replace(/,/g, ".").trim();
+    // apenas números simples (ex: "120", "45.6")
+    if (/^-?\d+(\.\d+)?$/.test(clean)) {
+      const n = parseFloat(clean);
+      return Number.isFinite(n) ? n : 0;
     }
   }
   return 0;
 }
-
+console.log(evalNumber(123));        // 123
+console.log(evalNumber("123"));      // 123
+console.log(evalNumber("45,6"));     // 45.6
+console.log(evalNumber("45.6"));     // 45.6
+console.log(evalNumber("abc"));      // 0
+console.log(evalNumber("1+2"));      // 0
 // ---------- Mapas de porções ----------
 export const pesoMedioPorUnidade: Record<string, number> = {
   melancia: 5000, melao: 1500, maçã: 130, maca: 130, laranja: 150, banana: 120,

@@ -1,4 +1,3 @@
-// src/ia/agents/exercise.ts
 import { AgentContext, AgentResult } from "./types";
 import { EXERCISE_SYSTEM_PROMPT } from "@/ai/prompts/exerciseLogger";
 

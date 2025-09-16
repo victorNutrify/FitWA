@@ -1,4 +1,3 @@
-// src/ia/agents/types.ts
 export type AgentDomain = "food" | "exercise" | "diet" | "recipes" | "shopping" | "unknown";
 
 export interface AgentContext {

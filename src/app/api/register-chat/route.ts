@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import { getAuth } from "firebase-admin/auth";
 import { FOOD_SYSTEM_PROMPT } from "@/ai/prompts/foodLogger";
+import { parseNumberSafe } from "@/lib/utils";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic"; // opcional, evita cache
@@ -291,16 +292,9 @@ function extrairMacrosOpenFood(produto: any, nomeNorm: string, nomeEncontrado: s
   };
 }
 
-function evalNumber(val: any) {
-  if (typeof val === "number") return val;
-  if (typeof val === "string") {
-    const clean = val.replace(/,/g, ".").replace(/\s+/g, "");
-    if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean);
-    if (/^[\d\.\+\-\*\/\(\)]+$/.test(clean)) {
-      try { return Function(`"use strict";return (${clean})`)(); } catch { return 0; }
-    }
-  }
-  return 0;
+function evalNumber(val: any): number {
+  const n = parseNumberSafe(val);
+  return Number.isFinite(n) ? n : 0;
 }
 
 // NORMALIZA o formato vindo da LLM (quantidade número, porcaoUnitaria "unidade", pesoEstimado, etc.)

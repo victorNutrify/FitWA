@@ -1,4 +1,3 @@
-// src/ia/agents/food.ts
 import { AgentContext, AgentResult } from "./types";
 import { FOOD_SYSTEM_PROMPT } from "@/ai/prompts/foodLogger";
 

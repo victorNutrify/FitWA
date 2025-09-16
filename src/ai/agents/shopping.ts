@@ -1,4 +1,3 @@
-// src/ia/agents/shopping.ts
 import { AgentContext, AgentResult, LLMCaller } from "./types";
 
 function parseJsonLoose(raw: string): any | null {

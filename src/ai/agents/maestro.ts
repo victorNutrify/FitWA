@@ -1,82 +1,174 @@
-// src/ia/agents/maestro.ts
-import { AgentContext, AgentDomain, AgentResult } from "./types";
+// src/ai/agents/maestro.ts
+import type { AgentContext, AgentDomain, AgentResult } from "./types";
 import { runFoodAgent } from "./food";
 import { runExerciseAgent } from "./exercise";
+import { runDietAgent } from "./diet";
+import { runRecipesAgent } from "./recipes";
+import { runShoppingAgent } from "./shopping";
+import fs from "node:fs";
+import path from "node:path";
 
-// Heurística leve para classificar
+// Lê um prompt .txt da pasta src/ai/prompts
+function loadPromptTxt(relPath: string) {
+  try {
+    const p = path.join(process.cwd(), "src", "ai", "prompts", relPath);
+    return fs.readFileSync(p, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Normaliza acentos/caixa
+function normalize(text: string) {
+  return (text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+// Último texto do usuário nas mensagens
+function lastUserText(messages: any[]): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role === "user") {
+      if (typeof m.content === "string") return m.content;
+      if (m?.content?.text) return String(m.content.text);
+    }
+  }
+  return "";
+}
+
+// Heurística rápida
 export function classifyIntentHeuristic(
   text: string,
   opts?: { hasImage?: boolean }
 ): AgentDomain {
-  const tRaw = (text || "").trim();
-  if (!tRaw) return "unknown";
+  const t = normalize(text).trim();
+  if (!t) return "unknown";
 
-  const t = tRaw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
+  // Imagem → prioriza logger de refeição
   if (opts?.hasImage) return "food";
 
-  const quantityUnitRe =
-    /\b\d+(?:[.,]\d+)?\s*(?:g|grama|gramas|kg|ml|mililitros?|l|litros?|unid(?:ade)?s?|fatia(?:s)?|colher(?:es)?|x)\b/;
-  const eatDrinkVerbsRe =
-    /\b(comi|bebi|tomei|almocei|jant(ei|ar)|lanche(i|ar)|ingeri|consumi)\b/;
-  if (quantityUnitRe.test(t) || eatDrinkVerbsRe.test(t)) {
-    const exerciseShapeRe = /\b(\d+(?:[.,]\d+)?\s*(?:km|kcal|min|mins|minutos?|h|horas?))\b/;
-    const exerciseVerbsRe =
-      /\b(corri|pedalei|nadar?|nadei|caminhei|musculacao|treinei|esteira|bicicleta|spinning|yoga|pilates|hiit)\b/;
-    if (!eatDrinkVerbsRe.test(t) && (exerciseShapeRe.test(t) || exerciseVerbsRe.test(t))) {
-      return "exercise";
+  // DIET (plano estruturado)
+  if (
+    /(dieta|plano alimentar|cardapio|plano de refeicoes|plano de dieta)/.test(t) ||
+    /(faca um plano|monte um plano|organizar refeicoes|estrutura de refeicoes)/.test(t) ||
+    /(5 refeicoes|cinco refeicoes)/.test(t)
+  ) return "diet";
+
+  // RECIPES
+  if (/(receita|modo de preparo|ingrediente(s)?|como fazer|passo a passo)/.test(t))
+    return "recipes";
+
+  // SHOPPING
+  if (
+    /(lista de compras|compras|mercado|supermercado|itens para comprar|despensa|reposicao)/.test(t) ||
+    /(montar lista|preciso comprar|repor dispensa|repor despensa)/.test(t)
+  ) return "shopping";
+
+  // FOOD (registro de refeição)
+  if (
+    /(comi|adicione|lancar|refeic(a|o)|alimento|kcal|caloria|grama|ml|porcao)/.test(t) ||
+    /(jantei|almoc(e|ei)|cafe da manha|lanche)/.test(t)
+  ) return "food";
+
+  // EXERCISE
+  if (/(treino|exercicio|corrida|musculacao|bike|ciclismo|queimei|gasto calorico)/.test(t))
+    return "exercise";
+
+  return "unknown";
+}
+
+// Classificador LLM (fallback) usando seu router.txt
+async function classifyIntentLLM(args: {
+  caller: any; // openAIChatCaller
+  openAIApiKey: string;
+  text: string;
+}): Promise<AgentDomain> {
+  const SYS = loadPromptTxt("router.txt");
+  const { caller, openAIApiKey, text } = args;
+
+  const res = await caller({
+    apiKey: openAIApiKey,
+    model: "gpt-4o-mini",
+    temperature: 0.0,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYS || "Classifique a intenção: food|exercise|diet|recipes|shopping|unknown. Responda em JSON: {\"domain\":\"...\"}" },
+      { role: "user", content: text || "classifique a intenção." },
+    ],
+  });
+
+  try {
+    const obj = res.json ?? JSON.parse(res.text);
+    const d = String(obj?.domain || "").toLowerCase();
+    if (["food", "exercise", "diet", "recipes", "shopping", "unknown"].includes(d)) {
+      return d as AgentDomain;
     }
-    return "food";
+  } catch {
+    // ignora e cai no fallback
   }
-
-  const foodOpsRe = /\b(remover|removi|excluir|exclui|apagar|substituir|corrigir)\b/;
-  if (foodOpsRe.test(t)) {
-    const exerciseWordsRe =
-      /\b(treino|corrida|ciclismo|musculacao|exercicio|esteira|bike|bicicleta|hiit|yoga|pilates)\b/;
-    if (exerciseWordsRe.test(t)) return "exercise";
-    return "food";
-  }
-
-  const exerciseHardRe =
-    /\b(corri|pedalei|nadei|nadar|caminhei|musculacao|treinei|esteira|bicicleta|spinning|remador|agachamento|supino|flexao|yoga|pilates|hiit)\b/;
-  const exerciseUnitsRe = /\b(\d+(?:[.,]\d+)?\s*(?:km|kcal|min|mins|minutos?|h|horas?))\b/;
-  if (exerciseHardRe.test(t) || exerciseUnitsRe.test(t)) return "exercise";
-
-  const dietPlanRe = /\b(plano|planejar|planejamento|cardapio|dieta|semana|macros|objetivo|cutting|bulking)\b/;
-  if (dietPlanRe.test(t)) return "diet";
-
-  const shoppingRe = /\b(lista\s+de\s+compras|supermercado|comprar|mercado|feira|preciso\s+comprar)\b/;
-  if (shoppingRe.test(t)) return "shopping";
-
-  const recipeRe = /\b(receita|como\s+fazer|modo\s+de\s+preparo|ingredientes|preparo|rendimento)\b/;
-  if (recipeRe.test(t)) return "recipes";
-
   return "unknown";
 }
 
 /**
  * Roteia para o agente certo.
- * Alinha a assinatura com os agentes que recebem (messages, ctx, openAIApiKey).
+ * IMPORTANTE: precisa receber `caller` (openAIChatCaller) porque o fallback LLM usa ele.
  */
-export async function routeIntent(opts: {
-  messages: Array<{ role: "user" | "assistant"; content: string }>;
+export async function routeIntent(args: {
+  messages: any[];
   ctx: AgentContext;
   openAIApiKey: string;
+  caller: any; // openAIChatCaller
   modelFood?: string;
   modelExercise?: string;
+  modelDiet?: string;
+  modelRecipes?: string;
+  modelShopping?: string;
 }): Promise<AgentResult> {
-  const { messages, ctx, openAIApiKey, modelFood = "gpt-4o", modelExercise = "gpt-4o" } = opts;
+  const {
+    messages,
+    ctx,
+    openAIApiKey,
+    caller,
+    modelFood = "gpt-4o-mini",
+    modelExercise = "gpt-4o-mini",
+    modelDiet = "gpt-4o-mini",
+    modelRecipes = "gpt-4o-mini",
+    modelShopping = "gpt-4o-mini",
+  } = args;
 
-  const lastUser =
-    [...messages].reverse().find((m) => m.role === "user")?.content || "";
+  const userText = lastUserText(messages);
 
-  let domain = classifyIntentHeuristic(lastUser, { hasImage: ctx.hasImage });
+  // 1) Heurística
+  let domain: AgentDomain = classifyIntentHeuristic(userText, { hasImage: ctx.hasImage });
 
+  // 2) Fallback LLM (se ainda desconhecido)
+  if (domain === "unknown") {
+    domain = await classifyIntentLLM({ caller, openAIApiKey, text: userText });
+  }
+
+  // 3) Default seguro
+  if (domain === "unknown") domain = "food";
+
+  // 4) Roteamento
   switch (domain) {
     case "food":
       return await runFoodAgent({ messages, ctx, openAIApiKey, model: modelFood });
+
     case "exercise":
       return await runExerciseAgent({ messages, ctx, openAIApiKey, model: modelExercise });
+
+    case "diet":
+      return await runDietAgent({ messages, ctx, openAIApiKey, model: modelDiet });
+
+    case "recipes":
+      return await runRecipesAgent({ messages, ctx, openAIApiKey, model: modelRecipes });
+
+    case "shopping":
+      return await runShoppingAgent({ messages, ctx, openAIApiKey, model: modelShopping });
+
     default:
       return { domain: "unknown", reply: "Não entendi sua solicitação.", data: {} };
   }

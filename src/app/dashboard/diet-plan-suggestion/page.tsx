@@ -6,26 +6,26 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Loader2 } from "lucide-react";
-import { db } from "@/lib/firebase.client";
+import { getFirebaseClient } from "@/lib/firebase.client";
 import { useAuth } from "@/context/AuthContext";
 import { collection, getDocs, setDoc, doc, getDoc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 
-// Novo parser para plano agrupado por refeição (formato da LLM atual)
+// Parser para plano agrupado por refeição (formato da LLM atual)
 function parseGroupedDietPlan(alimentos?: any[]) {
   if (!alimentos || !Array.isArray(alimentos) || alimentos.length === 0) return null;
   const meals: any[] = [];
-  let totals = { protein: 0, carbs: 0, fat: 0 };
+  const totals = { protein: 0, carbs: 0, fat: 0 };
   for (const refeicao of alimentos) {
-    if (!refeicao.refeicao || !Array.isArray(refeicao.alimentos)) continue;
+    if (!refeicao?.refeicao || !Array.isArray(refeicao.alimentos)) continue;
     const items: string[] = [];
     for (const a of refeicao.alimentos) {
       items.push(
         `${a.quantidade} de ${a.nome}: ${a.proteinas}g proteína, ${a.carboidratos}g carboidrato, ${a.gorduras}g gordura`
       );
-      totals.protein += Number(a.proteinas || 0);
-      totals.carbs += Number(a.carboidratos || 0);
-      totals.fat += Number(a.gorduras || 0);
+      totals.protein += Number(a?.proteinas ?? 0);
+      totals.carbs += Number(a?.carboidratos ?? 0);
+      totals.fat += Number(a?.gorduras ?? 0);
     }
     meals.push({ title: refeicao.refeicao, items });
   }
@@ -33,15 +33,21 @@ function parseGroupedDietPlan(alimentos?: any[]) {
 }
 
 export default function DietPlanSuggestionPage() {
+  // ✅ obter db do client SDK (evita import server-side)
+  const { db } = getFirebaseClient();
+
   const { user } = useAuth();
   const router = useRouter();
+
   const [observacao, setObservacao] = useState<string>("");
   const diasPlano = 7;
-  const [userMacros, setUserMacros] = useState<{protein: string, carbs: string, fat: string}>({
+
+  const [userMacros, setUserMacros] = useState<{ protein: string; carbs: string; fat: string }>({
     protein: "",
     carbs: "",
     fat: "",
   });
+
   const [dietPlan, setDietPlan] = useState<string>("");
   const [parsedPlan, setParsedPlan] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(false);
@@ -52,6 +58,7 @@ export default function DietPlanSuggestionPage() {
   const [loadingActive, setLoadingActive] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string>("");
 
+  // Carrega metas do usuário (proteína, carbo, gordura)
   useEffect(() => {
     async function fetchUserMacros() {
       if (!user?.email) {
@@ -64,31 +71,24 @@ export default function DietPlanSuggestionPage() {
         const metasSnap = await getDocs(metasCollectionRef);
 
         if (!metasSnap.empty) {
-          const docData = metasSnap.docs[0].data();
+          const docData: any = metasSnap.docs[0].data();
           setUserMacros({
-            protein: docData.proteina ? String(docData.proteina) : "",
-            carbs: docData.carboidrato ? String(docData.carboidrato) : "",
-            fat: docData.gordura ? String(docData.gordura) : "",
+            protein: docData?.proteina ? String(docData.proteina) : "",
+            carbs: docData?.carboidrato ? String(docData.carboidrato) : "",
+            fat: docData?.gordura ? String(docData.gordura) : "",
           });
         } else {
-          setUserMacros({
-            protein: "",
-            carbs: "",
-            fat: "",
-          });
+          setUserMacros({ protein: "", carbs: "", fat: "" });
         }
-      } catch (err) {
-        setUserMacros({
-          protein: "",
-          carbs: "",
-          fat: "",
-        });
+      } catch {
+        setUserMacros({ protein: "", carbs: "", fat: "" });
       }
       setLoadingMacros(false);
     }
     fetchUserMacros();
-  }, [user]);
+  }, [db, user]);
 
+  // Carrega plano ativo salvo (texto simples ou alimentos agrupados)
   useEffect(() => {
     async function fetchActivePlan() {
       if (!user?.email) {
@@ -102,40 +102,45 @@ export default function DietPlanSuggestionPage() {
         const planRef = doc(db, "chatfit", user.email, "planos", "dieta");
         const planSnap = await getDoc(planRef);
         if (planSnap.exists()) {
-          const data = planSnap.data();
-          setActivePlan(data.content || null);
-          setActiveAlimentos(data.alimentos || null);
+          const data: any = planSnap.data();
+          setActivePlan(data?.content || null);
+          setActiveAlimentos(Array.isArray(data?.alimentos) ? data.alimentos : null);
         } else {
           setActivePlan(null);
           setActiveAlimentos(null);
         }
-      } catch (err) {
+      } catch {
         setActivePlan(null);
         setActiveAlimentos(null);
       }
       setLoadingActive(false);
     }
     fetchActivePlan();
-  }, [user, dietPlan]);
+  }, [db, user, dietPlan]);
 
+  // Reset de visual ao alterar parâmetros
   useEffect(() => {
     setDietPlan("");
     setParsedPlan(null);
     setErrorMsg("");
   }, [observacao, userMacros.protein, userMacros.carbs, userMacros.fat]);
 
-  async function savePlanToFirestore(dietPlan: string, alimentos: any[] | null, userEmail: string) {
+  async function savePlanToFirestore(dietPlanStr: string, alimentos: any[] | null, userEmail: string) {
     if (!userEmail) return;
     try {
       const dietPlanRef = doc(db, "chatfit", userEmail, "planos", "dieta");
-      if (dietPlan) {
-        await setDoc(dietPlanRef, {
-          content: dietPlan,
-          alimentos: alimentos || [],
-          updatedAt: new Date().toISOString(),
-        }, { merge: false });
+      if (dietPlanStr) {
+        await setDoc(
+          dietPlanRef,
+          {
+            content: dietPlanStr,
+            alimentos: alimentos || [],
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: false }
+        );
       }
-    } catch (err) {
+    } catch {
       // opcional: setErrorMsg("Erro ao salvar plano no banco de dados.");
     }
   }
@@ -145,19 +150,16 @@ export default function DietPlanSuggestionPage() {
     setLoading(true);
     setErrorMsg("");
 
-    if (
-      !userMacros.protein ||
-      !userMacros.carbs ||
-      !userMacros.fat
-    ) {
+    if (!userMacros.protein || !userMacros.carbs || !userMacros.fat) {
       setErrorMsg("Preencha todas as metas de proteína, carboidratos e gordura.");
       setLoading(false);
       return;
     }
 
-    const obsFinal = observacao && observacao.trim().length > 0 ? observacao : "Nenhuma restrição específica.";
+    const obsFinal =
+      observacao && observacao.trim().length > 0 ? observacao : "Nenhuma restrição específica.";
 
-    // NOVO PROMPT - RESTRITIVO!
+    // PROMPT: retorna apenas o bloco JSON entre <FOODS_JSON>...</FOODS_JSON>
     const systemPrompt = `
 Faça um plano alimentar para UM DIA, o mais próximo possível das metas dos macros abaixo, sem desvio padrão.
 ATENÇÃO:
@@ -188,8 +190,8 @@ Observações/restrições do usuário: ${obsFinal}
 
     const messages = [
       { role: "system", content: systemPrompt },
-      { role: "user", content: obsFinal }
-    ];
+      { role: "user", content: obsFinal },
+    ] as const;
 
     try {
       const response = await fetch("/api/generate-diet-plan", {
@@ -197,26 +199,27 @@ Observações/restrições do usuário: ${obsFinal}
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages,
-          userEmail: user?.email || ""
+          userEmail: user?.email || "",
         }),
       });
 
-      let data;
+      let data: any;
       try {
         data = await response.json();
-      } catch (err) {
+      } catch {
         setErrorMsg("Erro interno ao decodificar resposta do servidor.");
         setLoading(false);
         return;
       }
 
-      if (!response.ok || data.error) {
-        setErrorMsg(data.error || "Não foi possível gerar o plano. Tente novamente.");
+      if (!response.ok || data?.error) {
+        setErrorMsg(data?.error || "Não foi possível gerar o plano. Tente novamente.");
         setDietPlan("");
         setParsedPlan(null);
-      } else if (data.reply) {
+      } else if (data?.reply) {
         setDietPlan(data.reply || "");
-        setParsedPlan(parseGroupedDietPlan(data.alimentos));
+        const parsed = parseGroupedDietPlan(data.alimentos);
+        setParsedPlan(parsed);
         await savePlanToFirestore(data.reply || "", data.alimentos || [], user?.email || "");
         setShowForm(false);
       } else {
@@ -224,7 +227,7 @@ Observações/restrições do usuário: ${obsFinal}
         setDietPlan("");
         setParsedPlan(null);
       }
-    } catch (err) {
+    } catch {
       setErrorMsg("Erro inesperado ao gerar plano. Tente novamente.");
       setDietPlan("");
       setParsedPlan(null);
@@ -236,16 +239,17 @@ Observações/restrições do usuário: ${obsFinal}
     if (!parsedPlan) return null;
     return (
       <div>
-        {parsedPlan.meals.length > 0 && parsedPlan.meals.map((meal: any, i: number) => (
-          <div key={i} className="mb-3">
-            <div className="font-semibold">{meal.title}</div>
-            <ul className="list-disc ml-5">
-              {meal.items.map((item: string, j: number) => (
-                <li key={j}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        ))}
+        {parsedPlan.meals.length > 0 &&
+          parsedPlan.meals.map((meal: any, i: number) => (
+            <div key={i} className="mb-3">
+              <div className="font-semibold">{meal.title}</div>
+              <ul className="list-disc ml-5">
+                {meal.items.map((item: string, j: number) => (
+                  <li key={j}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
         {parsedPlan.totals && (
           <div className="mt-4 p-2 bg-muted rounded">
             <div className="font-bold mb-1">Totais do Dia</div>
@@ -392,13 +396,17 @@ Observações/restrições do usuário: ${obsFinal}
                 </div>
               </div>
               <div>
-                <span className="block text-sm mb-2 font-semibold">Plano para <span className="font-bold">{diasPlano}</span> dias</span>
+                <span className="block text-sm mb-2 font-semibold">
+                  Plano para <span className="font-bold">{diasPlano}</span> dias
+                </span>
               </div>
-              {errorMsg && (
-                <div className="text-red-600 font-semibold text-sm mb-2">{errorMsg}</div>
-              )}
-              <Button type="submit" disabled={loading || loadingMacros} className="w-full bg-yellow-500 hover:bg-yellow-600 text-white border-none">
-                {(loading || loadingMacros) ? (
+              {errorMsg && <div className="text-red-600 font-semibold text-sm mb-2">{errorMsg}</div>}
+              <Button
+                type="submit"
+                disabled={loading || loadingMacros}
+                className="w-full bg-yellow-500 hover:bg-yellow-600 text-white border-none"
+              >
+                {loading || loadingMacros ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     IA está pensando, aguarde...
@@ -410,9 +418,7 @@ Observações/restrições do usuário: ${obsFinal}
             </form>
 
             <div className="mt-8">
-              <h3 className="text-lg font-bold mb-4">
-                Plano alimentar sugerido
-              </h3>
+              <h3 className="text-lg font-bold mb-4">Plano alimentar sugerido</h3>
               {loading ? (
                 <div className="flex items-center gap-2 text-center text-muted-foreground my-4">
                   <Loader2 className="animate-spin h-6 w-6" />
@@ -420,10 +426,10 @@ Observações/restrições do usuário: ${obsFinal}
                 </div>
               ) : errorMsg ? (
                 <div className="text-red-600 font-semibold text-sm">{errorMsg}</div>
+              ) : parsedPlan ? (
+                renderPlanoFormatado(parsedPlan)
               ) : (
-                parsedPlan
-                  ? renderPlanoFormatado(parsedPlan)
-                  : dietPlan && <div className="bg-muted/50 p-4 rounded-md text-sm whitespace-pre-line">{dietPlan}</div>
+                dietPlan && <div className="bg-muted/50 p-4 rounded-md text-sm whitespace-pre-line">{dietPlan}</div>
               )}
             </div>
           </CardContent>
