@@ -42,8 +42,144 @@ type Prefs = {
 };
 
 /* ================================
+   Prompt loader (SEM hardcode)
+================================ */
+const DIET_MODEL = process.env.DIET_MODEL ?? "gpt-5";
+
+function readPromptFile(fileName: string): string {
+  // prompts ficam em src/ai/prompts/*.txt
+  const p = path.join(process.cwd(), "src", "ai", "prompts", fileName);
+  try {
+    return fs.readFileSync(p, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function buildDietSystemPrompt(basePrompt: string, metas: { proteina: number; carbo: number; gordura: number }, prefsLines: string[]) {
+  // Anexa METAS/PREFERÊNCIAS e impõe o formato <FOODS_JSON>...</FOODS_JSON>
+  const metasBlock =
+    `\n\nMETAS (Firestore):\n` +
+    `- Proteína: ${metas.proteina}g (PRIORIDADE: atingir; pode passar até +5%)\n` +
+    `- Carboidratos: ${metas.carbo}g (NÃO ultrapassar)\n` +
+    `- Gordura: ${metas.gordura}g (NÃO ultrapassar)\n`;
+
+  const prefsBlock =
+    `\nPREFERÊNCIAS DO USUÁRIO:\n` +
+    (prefsLines.length ? prefsLines.join("\n") : "- (Nenhuma explícita)") + "\n";
+
+  const outputFormatBlock = `
+\nINSTRUÇÃO DE SAÍDA (OBRIGATÓRIA — IGNORE QUALQUER FORMATO ANTERIOR):
+- Retorne **apenas** o bloco <FOODS_JSON>...</FOODS_JSON> contendo um **ARRAY JSON** no formato:
+<FOODS_JSON>[
+  {
+    "refeicao": "Café da Manhã",
+    "alimentos": [
+      {"nome": "pão integral", "quantidade": "2 unid", "proteinas": 8, "carboidratos": 30, "gorduras": 2, "calorias": 160},
+      {"nome": "ovo de galinha", "quantidade": "2 unid", "proteinas": 12, "carboidratos": 2, "gorduras": 10, "calorias": 140}
+    ]
+  }
+]</FOODS_JSON>
+`.trim();
+
+  const safetyRules = `
+\nREGRAS ADICIONAIS (OBRIGATÓRIAS):
+- Use APENAS nomes genéricos de alimentos (sem marca).
+- Unidades PERMITIDAS no campo "quantidade": "g", "unid", "colher de sopa".
+- NÃO use "ml", "scoop", "fatia", "xícara" (converta mentalmente para g/unid/colher de sopa).
+- Para pós/suplementos (ex.: whey, proteína vegetal, creatina, BCAA, glutamina, pré-treino, albumina, colágeno, maltodextrina), use sempre "g" e limite **no MÁXIMO 40 g por refeição**.
+- Cada refeição deve ter no mínimo 2 itens; evite pratos pesados no café/lanche; respeite alergias/restrições.
+`.trim();
+
+  const base = basePrompt?.trim() ? basePrompt.trim() + "\n" : "";
+  return (base + metasBlock + prefsBlock + safetyRules + "\n" + outputFormatBlock).trim();
+}
+
+/* ================================
    Utils
 ================================ */
+type DietUnit = "g" | "unid" | "colher_sopa";
+type DietItem = { name: string; quantity: number; unit: DietUnit };
+type DietMeal = { meal: string; items: DietItem[] };
+type DietPlan = { meals: DietMeal[]; notes?: string };
+
+const SUPPLEMENT_KEYS = [
+  "whey", "proteína", "proteina", "caseína", "caseina", "albumina",
+  "bcaa", "glutamina", "creatina", "colágeno", "colageno",
+  "pré-treino", "pre-treino", "pre treino", "termogênico", "termogenico",
+  "hipercalórico", "hipercalorico", "maltodextrina", "dextrose"
+];
+
+function isSupplement(name: string): boolean {
+  const n = (name || "").toLowerCase();
+  return SUPPLEMENT_KEYS.some(k => n.includes(k));
+}
+
+// Normaliza a string "quantidade" para g | unid | colher de sopa (sem ml/scoop/fatia/xícara/pacote)
+function normalizeQuantityOut(nome: string, quantidade: string, grams: number, isSupplementFlag: boolean): string {
+  const qn = normalizeStr(quantidade);
+  const nn = normalizeStr(nome);
+
+  // termos de embalagem → preferir g na saída (nada de "1 unid pacote")
+  const hasPackage = /\b(pacote|sache|sach[eê]|lata|garrafa|caixa|frasco|embalagem|pote|potinho)\b/.test(nn) ||
+                     /\b(pacote|sache|sach[eê]|lata|garrafa|caixa|frasco|embalagem|pote|potinho)\b/.test(qn);
+
+  // suplementos: sempre g e clamp a 40 g
+  if (isSupplementFlag) {
+    const g = Math.min(40, Math.max(1, Math.round(grams)));
+    return `${g} g`;
+  }
+
+  // "ml" -> g
+  if (/\bml\b/.test(qn)) {
+    const g = Math.max(1, Math.round(grams));
+    return `${g} g`;
+  }
+
+  // "scoop" -> colher de sopa
+  if (/\bscoop/.test(qn) || /colher(?:es)?\s*de\s*medida/.test(qn)) {
+    const m = qn.match(/(\d+(?:[.,]\d+)?)|([½⅓¼¾])/);
+    const map: Record<string, number> = { "½": 0.5, "⅓": 1/3, "¼": 0.25, "¾": 0.75 };
+    let n = 1;
+    if (m) n = parseFloat((m[1] || map[m[2] || ""] || 1).toString().replace(",", ".")) || 1;
+    const qty = Math.max(1, Math.round(n));
+    return `${qty} colher de sopa`;
+  }
+
+  // "fatia" -> unid (mas só para pão); demais casos, preferir g se tiver ambiguidade
+  if (/fatia/.test(qn)) {
+    const m = qn.match(/(\d+(?:[.,]\d+)?)|([½⅓¼¾])/);
+    const map: Record<string, number> = { "½": 0.5, "⅓": 1/3, "¼": 0.25, "¾": 0.75 };
+    let n = 1;
+    if (m) n = parseFloat((m[1] || map[m[2] || ""] || 1).toString().replace(",", ".")) || 1;
+    const qty = Math.max(1, Math.round(n));
+    return /p[aã]o/.test(nn) ? `${qty} unid` : `${Math.max(1, Math.round(grams))} g`;
+  }
+
+  // "xícara" -> g
+  if (/x[ií]cara/.test(qn)) {
+    return `${Math.max(1, Math.round(grams))} g`;
+  }
+
+  // "colher de sopa" → manter
+  if (/colher(?:es)?\s*de\s*sopa/.test(qn)) {
+    return quantidade.replace(/\s+/g, " ").trim();
+  }
+
+  // "unid" → se tiver termo de embalagem, converta para g; senão mantenha
+  if (/\bunid(?:ade)?\b|\bun\b/.test(qn)) {
+    if (hasPackage) return `${Math.max(1, Math.round(grams))} g`;
+    const m = qn.match(/(\d+(?:[.,]\d+)?)|([½⅓¼¾])/);
+    let n = 1;
+    if (m) n = parseFloat((m[1] || "1").replace(",", ".")) || 1;
+    const qty = Math.max(1, Math.round(n));
+    return `${qty} unid`;
+  }
+
+  // fallback → g
+  return `${Math.max(1, Math.round(grams))} g`;
+}
+
 function toNumber(val: any): number {
   const n = typeof val === "string" ? parseFloat(val.replace(",", ".")) : Number(val);
   return Number.isFinite(n) ? n : 0;
@@ -56,12 +192,14 @@ function normalizeStr(s: string) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
 }
+
 function extractFoodsBlock(raw: string): string {
   if (!raw) return "[]";
   const m = raw.match(/<FOODS_JSON>([\s\S]*?)<\/FOODS_JSON>/i);
   const inside = (m ? m[1] : raw).trim();
   return inside.replace(/^```json\s*|\s*```$/g, "").trim();
 }
+
 function normalizeFoodsJson(data: any) {
   if (Array.isArray(data)) return data;
   if (data && typeof data === "object") {
@@ -105,69 +243,75 @@ function loadFoodsDB(): FoodDB[] {
 }
 
 /* ================================
-   Fallback per-100g (evita 0g)
+   Fallback per-100g
 ================================ */
+// === Fallback per-100g (evita 0g) ===
 const HARD_PER100: Record<string, FoodDB> = {
+  // Pães
   "pão integral": { name: "pão integral", calories: 247, protein: 13, carbs: 41, fat: 4, source: "hard" },
   "pão sem glúten": { name: "pão sem glúten", calories: 250, protein: 6, carbs: 50, fat: 3, source: "hard" },
+  "pão de forma": { name: "pão de forma", calories: 265, protein: 9, carbs: 49, fat: 3, source: "hard" },
 
+  // Pastas / oleaginosas
   "pasta de amendoim": { name: "pasta de amendoim", calories: 588, protein: 25, carbs: 20, fat: 50, source: "hard" },
   "amêndoas": { name: "amêndoas", calories: 579, protein: 21.2, carbs: 21.6, fat: 49.9, source: "hard" },
   "castanha de caju": { name: "castanha de caju", calories: 553, protein: 18.2, carbs: 30.2, fat: 43.9, source: "hard" },
 
+  // Pastas / homus
   "homus": { name: "homus", calories: 166, protein: 8, carbs: 14.3, fat: 9.6, source: "hard" },
   "hummus": { name: "hummus", calories: 166, protein: 8, carbs: 14.3, fat: 9.6, source: "hard" },
 
+  // Gorduras
   "azeite de oliva": { name: "azeite de oliva", calories: 884, protein: 0, carbs: 0, fat: 100, source: "hard" },
   "azeite de oliva extra virgem": { name: "azeite de oliva extra virgem", calories: 884, protein: 0, carbs: 0, fat: 100, source: "hard" },
 
+  // Hortaliças / legumes
   "alface": { name: "alface", calories: 15, protein: 1.4, carbs: 2.9, fat: 0.2, source: "hard" },
   "alface crespa": { name: "alface crespa", calories: 15, protein: 1.4, carbs: 2.9, fat: 0.2, source: "hard" },
-
   "cenoura": { name: "cenoura", calories: 41, protein: 0.9, carbs: 10, fat: 0.2, source: "hard" },
   "brócolis cozido": { name: "brócolis cozido", calories: 35, protein: 2.4, carbs: 7.2, fat: 0.4, source: "hard" },
+  "espinafre cozido": { name: "espinafre cozido", calories: 23, protein: 2.9, carbs: 3.6, fat: 0.4, source: "hard" },
+  "legumes variados": { name: "legumes variados", calories: 40, protein: 2, carbs: 8, fat: 0.5, source: "hard" },
 
+  // Feijões / grãos cozidos
   "quinoa cozida": { name: "quinoa cozida", calories: 120, protein: 4.4, carbs: 21.3, fat: 1.9, source: "hard" },
   "grão de bico cozido": { name: "grão de bico cozido", calories: 164, protein: 9, carbs: 27.4, fat: 2.6, source: "hard" },
+  "arroz integral cozido": { name: "arroz integral cozido", calories: 124, protein: 2.6, carbs: 25.8, fat: 1, source: "hard" },
+  "batata doce cozida": { name: "batata doce cozida", calories: 86, protein: 1.6, carbs: 20.1, fat: 0.1, source: "hard" },
 
+  // Frutas
   "banana": { name: "banana", calories: 89, protein: 1.1, carbs: 22.8, fat: 0.3, source: "hard" },
   "abacate": { name: "abacate", calories: 160, protein: 2, carbs: 9, fat: 15, source: "hard" },
 
+  // Ovos / derivados
   "ovo de galinha": { name: "ovo de galinha", calories: 155, protein: 13, carbs: 1.1, fat: 11, source: "hard" },
   "clara de ovo pasteurizada": { name: "clara de ovo pasteurizada", calories: 44, protein: 11, carbs: 0, fat: 0, source: "hard" },
 
+  // Proteínas vegetais / suplementos
   "proteína isolada de soja (sem lactose e sem glúten)": {
-    name: "proteína isolada de soja (sem lactose e sem glúten)",
-    calories: 403, protein: 90, carbs: 3.3, fat: 3.3, source: "hard"
+    name: "proteína isolada de soja (sem lactose e sem glúten)", calories: 403, protein: 90, carbs: 3.3, fat: 3.3, source: "hard"
   },
   "proteína isolada de ervilha (sem lactose e sem glúten)": {
-    name: "proteína isolada de ervilha (sem lactose e sem glúten)",
-    calories: 395, protein: 80, carbs: 10, fat: 5, source: "hard"
+    name: "proteína isolada de ervilha (sem lactose e sem glúten)", calories: 395, protein: 80, carbs: 10, fat: 5, source: "hard"
   },
   "maltodextrina": { name: "maltodextrina", calories: 386, protein: 0, carbs: 96.5, fat: 0, source: "hard" },
-  "biscoito integral": { name: "biscoito integral", calories: 430, protein: 8, carbs: 70, fat: 12, source: "hard" },
-  "pão de forma":            { name: "pão de forma",            calories: 265, protein: 9,   carbs: 49,  fat: 3,   source: "hard" },
-  "arroz integral cozido":   { name: "arroz integral cozido",   calories: 124, protein: 2.6, carbs: 25.8, fat: 1,   source: "hard" },
-  "batata doce cozida":      { name: "batata doce cozida",      calories: 86,  protein: 1.6, carbs: 20.1, fat: 0.1, source: "hard" },
-  "espinafre cozido":        { name: "espinafre cozido",        calories: 23,  protein: 2.9, carbs: 3.6,  fat: 0.4, source: "hard" },
-  "proteína vegetal em pó":  { name: "proteína vegetal em pó",  calories: 395, protein: 80,  carbs: 10,  fat: 5,   source: "hard" },
 
+  // NOVOS essenciais
+  "tofu": { name: "tofu", calories: 76, protein: 8, carbs: 1.9, fat: 4.8, source: "hard" },
+  "peito de frango": { name: "peito de frango", calories: 165, protein: 31, carbs: 0, fat: 3.6, source: "hard" },
+  "macarrão de sêmola cozido": { name: "macarrão de sêmola cozido", calories: 157, protein: 5.8, carbs: 30.9, fat: 1, source: "hard" },
+  "proteína vegetal em pó": { name: "proteína vegetal em pó", calories: 395, protein: 80, carbs: 10, fat: 5, source: "hard" },
 };
 
-// Normalizações de nomes (marca → genérico)
-const FOOD_ALIASES: Record<string, string> = {
-  "pão integral girassol e castanha wickbold pacote 400g": "pão integral",
-  "pão integral girassol wickbold": "pão integral",
-  "macarrão de sêmola grano duro espaguete 8 adria pacote 500g": "macarrão de sêmola",
-  "iogurte integral com preparado de abacaxi": "iogurte integral",
-  "palitos de zanahoria": "cenoura",
-  "shake de proteína vegetal": "proteína vegetal em pó",
-  "ovo de galinha": "ovo",
-};
+// === Índice normalizado para HARD_PER100 (corrige casos com 0g) ===
+const HARD_INDEX: Record<string, FoodDB> = Object.fromEntries(
+  Object.entries(HARD_PER100).map(([k, v]) => [canonicalizeName(k), v])
+);
+function hardLookup(name: string): FoodDB | null {
+  return HARD_INDEX[canonicalizeName(name)] ?? null;
+}
 
-/* ================================
-   Matching com sinônimos e Jaccard
-================================ */
+// === Normalizações de nomes (marca → genérico) ===
 const ALIAS: { rx: RegExp; canon: string }[] = [
   // Marcas/variações → genérico
   { rx: /wickbold/i, canon: "pão integral" },
@@ -176,19 +320,20 @@ const ALIAS: { rx: RegExp; canon: string }[] = [
   // Itens básicos e vegetais
   { rx: /tofu/i, canon: "tofu" },
   { rx: /quinoa/i, canon: "quinoa cozida" },
-  { rx: /gr[aã]o de bico/i, canon: "grão de bico cozido" },
+  { rx: /gr[aã]o de bico(?!.*cozido)/i, canon: "grão de bico cozido" },
   { rx: /br[oó]colis/i, canon: "brócolis cozido" },
   { rx: /espinafre/i, canon: "espinafre cozido" },
-  { rx: /salada.*folhas|folhas verdes|mix de folhas/i, canon: "alface" },
+  { rx: /salada.*(mista|variada)|mix de folhas|folhas verdes/i, canon: "legumes variados" },
   { rx: /alface(?:\s+crespa)?/i, canon: "alface crespa" },
-  { rx: /banana/i, canon: "banana" },
+  { rx: /banana(\s+prata)?/i, canon: "banana" },
   { rx: /abacate/i, canon: "abacate" },
   { rx: /cenoura|zanahoria/i, canon: "cenoura" },
 
   // Pães / glúten
   { rx: /p[aã]o integral/i, canon: "pão integral" },
-  { rx: /p[aã]o.*gl[uú]ten|sem gl[uú]ten/i, canon: "pão sem glúten" },
+  { rx: /p[aã]o.*sem gl[uú]ten/i, canon: "pão sem glúten" },
   { rx: /torrada.*integral/i, canon: "pão integral" },
+  { rx: /p[aã]o de forma/i, canon: "pão de forma" },
 
   // Pastas / laticínios vegetais
   { rx: /pasta de amendoim|manteiga de amendoim/i, canon: "pasta de amendoim" },
@@ -202,30 +347,21 @@ const ALIAS: { rx: RegExp; canon: string }[] = [
   // Carboidratos cozidos
   { rx: /arroz integral/i, canon: "arroz integral cozido" },
   { rx: /batata.*doce/i, canon: "batata doce cozida" },
+  { rx: /macarr[aã]o.*(s[eê]mola|espaguete|grano duro)/i, canon: "macarrão de sêmola cozido" },
 
   // Preparações
   { rx: /hamb[uú]rguer.*lentilha/i, canon: "hambúrguer de lentilha" },
 
   // Ovos / whey
   { rx: /ovo/i, canon: "ovo de galinha" },
-  { rx: /shake.*prote[ií]na.*vegetal/i, canon: "proteína isolada de soja (sem lactose e sem glúten)" },
+  { rx: /fil[eé]\s*de\s*peito|peito de frango/i, canon: "peito de frango" },
   { rx: /whey|case[ií]na|soro de leite/i, canon: "proteína isolada de soja (sem lactose e sem glúten)" },
-  
-  { rx: /gr[aã]o de bico\b(?!\s*cozido)/i, canon: "grão de bico cozido" },
-  { rx: /smoothie.*prote[ií]na.*vegetal/i, canon: "proteína isolada de soja (sem lactose e sem glúten)" },
-  { rx: /shake.*prote[ií]na.*vegetal/i, canon: "proteína isolada de soja (sem lactose e sem glúten)" },
+
+  // Snacks industrializados
   { rx: /biscoito.*nesfit.*laranja.*cenoura/i, canon: "biscoito integral" },
   { rx: /biscoito.*nesfit/i, canon: "biscoito integral" },
 ];
 
-const canon = canonicalizeName(nome);
-const alias = FOOD_ALIASES[canon] ?? canon;
-
-const per100 =
-  findBestFood(alias) ||
-  HARD_PER100[alias.toLowerCase()] ||
-  (await fetchOpenFood(req, alias)) ||
-  null;
 
 function tokens(s: string) {
   return normalizeStr(s).split(/[^a-z0-9]+/).filter(Boolean);
@@ -238,45 +374,52 @@ function jaccard(a: string[], b: string[]) {
 }
 function findBestFood(query: string): FoodDB | null {
   const db = loadFoodsDB();
-  const q0 = canonicalizeName(query);
-  const qn = normalizeStr(q0);
+  const q0 = canonicalizeName(query);   // sem acentos, minúsculo, trims
+  const qt = tokens(q0);
 
-  // 1) base local
-  let best = db.find(f => normalizeStr(f.name) === qn);
+  // — DB: match exato
+  let best = db.find(f => canonicalizeName(f.name) === q0);
   if (best) return best;
-  const starts = db.filter(f => normalizeStr(f.name).startsWith(qn));
-  if (starts[0]) return starts[0];
-  const contains = db.filter(f => normalizeStr(f.name).includes(qn));
-  if (contains[0]) return contains[0];
 
-  // 2) hard fallback
-  const hard = HARD_PER100[q0.toLowerCase()];
+  // — DB: começa com
+  best = db.find(f => canonicalizeName(f.name).startsWith(q0));
+  if (best) return best;
+
+  // — DB: contém
+  best = db.find(f => canonicalizeName(f.name).includes(q0));
+  if (best) return best;
+
+  // — HARD: exato normalizado
+  const hard = hardLookup(q0);
   if (hard) return hard;
 
-  // 3) jaccard na base
-  const qt = tokens(q0);
+  // — DB: similaridade por Jaccard
   let maxScore = 0;
+  let bestDb: FoodDB | null = null;
   for (const f of db) {
     const sc = jaccard(qt, tokens(f.name));
-    if (sc > maxScore) { maxScore = sc; best = f; }
+    if (sc > maxScore) { maxScore = sc; bestDb = f; }
   }
-  if (maxScore >= 0.34 && best) return best;
+  if (maxScore >= 0.34 && bestDb) return bestDb;
 
-  // 4) jaccard no hard
-  let bestHard: FoodDB | null = null; maxScore = 0;
-  for (const k of Object.keys(HARD_PER100)) {
+  // — HARD: similaridade por Jaccard nas chaves normalizadas
+  maxScore = 0;
+  let bestHard: FoodDB | null = null;
+  for (const [k, v] of Object.entries(HARD_INDEX)) {
     const sc = jaccard(qt, tokens(k));
-    if (sc > maxScore) { maxScore = sc; bestHard = HARD_PER100[k]; }
+    if (sc > maxScore) { maxScore = sc; bestHard = v; }
   }
   return (maxScore >= 0.5 && bestHard) ? bestHard : null;
 }
 
 function stripBrand(q: string) {
-  // normaliza e remove marcas/ruídos
+  // remove marcas, embalagens e pesos explícitos do NOME exibido
   let s = normalizeStr(q)
-    .replace(/\b(wickbold|nesfit|adria|piraque|bauducco|pacote|sache|sach[eê]|lata|garrafa|caixa)\b/g, " ")
-    .replace(/\b(girassol|castanha|laranja|cenoura)\b/g, " ")
-    .replace(/\b\d+\s*g\b/g, " ")
+    .replace(/\b(wickbold|nesfit|adria|piraque|bauducco|renata|barilla|qualy|itamb[eé]|ninho)\b/g, " ")
+    .replace(/\b(pacote|pacotes|sache|sach[eê]s|lata|garrafa|caixa|frasco|embalagem|pote|potinho)\b/g, " ")
+    .replace(/\bgrano duro\b/g, " ")
+    .replace(/\bespaguete\b/g, " ")
+    .replace(/\b\d+\s*(g|kg|ml|l)\b/g, " ") // remove "500g", "1kg", "200 ml" do nome
     .replace(/\s+/g, " ")
     .trim();
 
@@ -285,7 +428,7 @@ function stripBrand(q: string) {
 }
 
 /* ================================
-   Porções (com frações)
+   Porções / conversões
 ================================ */
 const UNIT_DEFAULTS = {
   scoop_g: 30,
@@ -297,8 +440,7 @@ const UNIT_DEFAULTS = {
 };
 
 const NAME_PORTIONS: {
-  rx: RegExp; gramsPerUnit?: number;
-  unit?: "fatia"|"colher"|"unidade"|"xicara"
+  rx: RegExp; gramsPerUnit?: number; unit?: "fatia"|"colher"|"unidade"|"xicara"
 }[] = [
   { rx: /quinoa/i, gramsPerUnit: 185, unit: "xicara" },
   { rx: /gr[aã]o de bico/i, gramsPerUnit: 164, unit: "xicara" },
@@ -316,36 +458,70 @@ const NAME_PORTIONS: {
   { rx: /banana/i, gramsPerUnit: 120, unit: "unidade" },
   { rx: /abacate/i, gramsPerUnit: 200, unit: "unidade" },
   { rx: /p[aã]o de forma/i, gramsPerUnit: 25, unit: "fatia" },
-  { rx: /biscoito.*integral/i, gramsPerUnit: 30, unit: "porcao" }, // ~ 5-6 unidades
+  { rx: /biscoito.*integral/i, gramsPerUnit: 30, unit: "porcao" },
   { rx: /arroz integral cozido/i, gramsPerUnit: 160, unit: "xicara" },
   { rx: /batata doce cozida/i, gramsPerUnit: 150, unit: "porcao" },
 ];
 
-// Itens compostos (pão+abacate, mix de castanhas)
+// ======================================================
+// Itens compostos (ex.: torrada com abacate, iogurte+granola, mix de castanhas)
+// Usado pelo recalcItemFromDB para dividir/estimar componentes.
+// ======================================================
+type PerUnitRef = "fatia" | "colher" | "unidade" | "xicara" | "prato" | "porcao";
+
 const COMPOSED: {
   rx: RegExp;
-  components: Array<
-    { name: string; gramsPerUnit: number; perUnitRef: "fatia" | "colher" | "unidade" | "xicara" | "prato" | "porcao" }
-  >;
+  components: Array<{ name: string; gramsPerUnit: number; perUnitRef: PerUnitRef }>;
 }[] = [
+  // Pão/torrada integral com abacate
   {
-    rx: /torrada.*(integral)?.*abacate/i,
+    rx: /torrada.*(integral)?.*abacate|p[aã]o.*(integral)?.*abacate/i,
     components: [
       { name: "pão integral", gramsPerUnit: 25, perUnitRef: "fatia" },
-      { name: "abacate", gramsPerUnit: 20, perUnitRef: "fatia" },
+      { name: "abacate",      gramsPerUnit: 20, perUnitRef: "fatia" },
     ],
   },
+
+  // Iogurte (de soja) com granola
+  {
+    rx: /iogurte.*(natural|de soja).*(com)?\s*granola|granola.*(com)?\s*iogurte/i,
+    components: [
+      { name: "iogurte de soja", gramsPerUnit: 170, perUnitRef: "unidade" }, // se for iogurte comum, o alias/base cobre
+      { name: "granola",         gramsPerUnit: 16,  perUnitRef: "colher"  },
+    ],
+  },
+
+  // Pão de forma com pasta de amendoim
+  {
+    rx: /p[aã]o de forma.*(pasta|manteiga) de amendoim|pasta de amendoim.*p[aã]o de forma/i,
+    components: [
+      { name: "pão de forma",       gramsPerUnit: 25, perUnitRef: "fatia"  },
+      { name: "pasta de amendoim",  gramsPerUnit: 16, perUnitRef: "colher" },
+    ],
+  },
+
+  // Mix de castanhas (estimativa genérica)
   {
     rx: /mix.*castanhas|mix de castanhas/i,
     components: [
-      { name: "amêndoas", gramsPerUnit: 0, perUnitRef: "unidade" },
+      { name: "amêndoas",         gramsPerUnit: 0, perUnitRef: "unidade" },
       { name: "castanha de caju", gramsPerUnit: 0, perUnitRef: "unidade" },
+    ],
+  },
+
+  // Salada mista (folhas + legumes)
+  {
+    rx: /salada mista|salada.*(mista|variada)/i,
+    components: [
+      { name: "alface",           gramsPerUnit: 50,  perUnitRef: "xicara" },
+      { name: "cenoura",          gramsPerUnit: 128, perUnitRef: "xicara" },
+      { name: "brócolis cozido",  gramsPerUnit: 90,  perUnitRef: "xicara" },
     ],
   },
 ];
 
-const MIN_G = 12;   // ~ 1 colher de sopa
-const MAX_G = 250;  // limite por item
+const MIN_G = 12;
+const MAX_G = 250;
 function clampGrams(g: number) {
   return Math.max(MIN_G, Math.min(MAX_G, Math.round(g)));
 }
@@ -354,6 +530,7 @@ function quantityToGrams(nome: string, quantidade: string): { grams: number; rea
   const qn = normalizeStr(quantidade);
   const name = canonicalizeName(nome);
 
+  function toNumber(s: string): number { return parseFloat(s.replace(",", ".")); }
   function parseNumberLike(s: string): number | null {
     s = s.trim();
     if (/^\d+(?:[.,]\d+)?$/.test(s)) return toNumber(s);
@@ -362,22 +539,28 @@ function quantityToGrams(nome: string, quantidade: string): { grams: number; rea
       return b ? a / b : null;
     }
     if (/[½⅓¼¾]/.test(s)) {
-      const map: Record<string, number> = { "½": 0.5, "⅓": 1 / 3, "¼": 0.25, "¾": 0.75 };
+      const map: Record<string, number> = { "½": 0.5, "⅓": 1/3, "¼": 0.25, "¾": 0.75 };
       return map[s] ?? null;
     }
     return null;
   }
+
   const numMatch = qn.match(/([0-9]+(?:[.,][0-9]+)?|[0-9]+\s*\/\s*[0-9]+|[½⅓¼¾])/);
   const n = numMatch ? parseNumberLike(numMatch[1]) ?? 1 : 1;
 
-  // g / ml explícitos
+  // g explícito
   const gMatch = qn.match(/(-?\d+(?:[.,]\d+)?)\s*g\b/);
-  if (gMatch) return { grams: clampGrams(toNumber(gMatch[1])), reason: "g-explicit" };
-  const mlMatch = qn.match(/(-?\d+(?:[.,]\d+)?)\s*ml\b/);
-  if (mlMatch) return { grams: clampGrams(toNumber(mlMatch[1])), reason: "ml≈g" };
+  if (gMatch) return { grams: clampGrams(parseFloat(gMatch[1].replace(",", "."))), reason: "g-explicit" };
 
-  // scoops
-  if (/\bscoops?\b/.test(qn)) return { grams: clampGrams((n ?? 1) * UNIT_DEFAULTS.scoop_g), reason: "scoop" };
+  // ml -> g (aprox 1:1)
+  const mlMatch = qn.match(/(-?\d+(?:[.,]\d+)?)\s*ml\b/);
+  if (mlMatch) return { grams: clampGrams(parseFloat(mlMatch[1].replace(",", "."))), reason: "ml≈g" };
+
+  // scoop(s) -> colher de sopa
+  if (/\bscoops?\b|\bcolher(?:es)?\s*de\s*medida\b/.test(qn)) {
+    const byName = NAME_PORTIONS.find(r => r.rx.test(name) && r.unit === "colher")?.gramsPerUnit ?? UNIT_DEFAULTS.colher_sopa_g;
+    return { grams: clampGrams((n ?? 1) * byName), reason: "scoop->colher-sopa" };
+  }
 
   // colher de sopa
   if (/colher(?:es)?\s*de\s*sopa/.test(qn)) {
@@ -404,14 +587,16 @@ function quantityToGrams(nome: string, quantidade: string): { grams: number; rea
     return { grams: clampGrams((n ?? 1) * byName), reason: "pote" };
   }
 
-    // copo (~240 ml)
+  // copo (~240 ml)
   if (/copo(?:s)?/.test(qn)) {
     return { grams: clampGrams((n ?? 1) * 240), reason: "copo-ml" };
   }
 
-  // unidade
+  // unidade  ✅ trata pão como fatia (25 g) quando vier "unid"
   if (/unidade(?:s)?|\bun\b/.test(qn)) {
-    const byName = NAME_PORTIONS.find(r => r.rx.test(name) && r.unit === "unidade")?.gramsPerUnit ?? UNIT_DEFAULTS.unidade_g;
+    const byName = NAME_PORTIONS.find(r =>
+      r.rx.test(name) && (r.unit === "unidade" || r.unit === "fatia")
+    )?.gramsPerUnit ?? UNIT_DEFAULTS.unidade_g;
     return { grams: clampGrams((n ?? 1) * byName), reason: "unidade" };
   }
 
@@ -433,8 +618,8 @@ function quantityToGrams(nome: string, quantidade: string): { grams: number; rea
   }
 
   // fallback por nome
-  const byName = NAME_PORTIONS.find(r => r.rx.test(name))?.gramsPerUnit;
-  if (byName) return { grams: clampGrams(byName), reason: "nome-fallback" };
+  const byName2 = NAME_PORTIONS.find(r => r.rx.test(name))?.gramsPerUnit;
+  if (byName2) return { grams: clampGrams(byName2), reason: "nome-fallback" };
 
   // 100 g padrão
   return { grams: clampGrams(100), reason: "default-100g" };
@@ -473,24 +658,27 @@ async function recalcItemFromDB(
   nome: string,
   quantidade: string
 ): Promise<z.infer<typeof AlimentoSchema>> {
-  const originalName = nome;
-  const canonical = canonicalizeName(nome);
+  const originalName = typeof nome === "string" ? nome : "";
+  const displayName = resolveToGenericName(originalName); // <-- SEMPRE genérico!
+  const canonical = canonicalizeName(displayName);
   const { grams } = quantityToGrams(canonical, quantidade);
+  const supplement = isSupplement(displayName);
 
-  // 0) forçar 30g se for "proteína isolada *" sem unidade
+  // Regra: "proteína isolada" sem unidade → 30 g (≤ 40 g)
   if (
     /prote[ií]na isolada/.test(normalizeStr(canonical)) &&
-    !/g\b|ml\b|scoop|colher|fatia|unidade|x[ií]cara/.test(normalizeStr(quantidade))
+    !/g\b|ml\b|scoop|colher|fatia|unidade|un\b|x[ií]cara/.test(normalizeStr(quantidade))
   ) {
     const per100Forced =
       findBestFood(canonical) ||
-      HARD_PER100[canonical.toLowerCase()] ||
+      hardLookup(canonical) ||
       (await fetchOpenFood(req, canonical));
-    const factorF = 30 / 100;
+    const gramsForced = 30;
+    const factorF = gramsForced / 100;
     if (per100Forced) {
       return {
-        nome: per100Forced.name,
-        quantidade: "30g",
+        nome: displayName,
+        quantidade: `${gramsForced} g`,
         proteinas: round1((per100Forced.protein || 0) * factorF),
         carboidratos: round1((per100Forced.carbs || 0) * factorF),
         gorduras: round1((per100Forced.fat || 0) * factorF),
@@ -499,28 +687,29 @@ async function recalcItemFromDB(
     }
   }
 
-  // 1) Itens compostos
+  // Itens compostos
   const comp = COMPOSED.find((c) => c.rx.test(canonical));
   if (comp) {
     const explicitG = /(-?\d+(?:[.,]\d+)?)\s*g\b/.test(normalizeStr(quantidade));
     let totals = { p: 0, c: 0, f: 0, kcal: 0 };
+    let outQuantity = quantidade;
 
     if (explicitG) {
-      const each = Math.max(1, Math.floor(grams / comp.components.length));
+      const gramsClamped = supplement ? Math.min(40, grams) : grams;
+      const each = Math.max(1, Math.floor(gramsClamped / comp.components.length));
       for (const part of comp.components) {
         const per100 =
           findBestFood(part.name) ||
-          HARD_PER100[part.name.toLowerCase()] ||
+          hardLookup(part.name) ||
           (await fetchOpenFood(req, part.name));
-
-        if (per100) {
-          const factor = each / 100;
-          totals.p += (per100.protein || 0) * factor;
-          totals.c += (per100.carbs || 0) * factor;
-          totals.f += (per100.fat || 0) * factor;
-          totals.kcal += (per100.calories || 0) * factor;
-        }
+        if (!per100) continue;
+        const factor = each / 100;
+        totals.p += (per100.protein || 0) * factor;
+        totals.c += (per100.carbs || 0) * factor;
+        totals.f += (per100.fat || 0) * factor;
+        totals.kcal += (per100.calories || 0) * factor;
       }
+      outQuantity = normalizeQuantityOut(displayName, quantidade, gramsClamped, supplement);
     } else {
       function unitsFor(ref: string) {
         const qn = normalizeStr(quantidade);
@@ -534,46 +723,28 @@ async function recalcItemFromDB(
         if (ref === "porcao" && /por[cç][aã]o/.test(qn)) return n;
         return 1;
       }
-
       for (const part of comp.components) {
         const units = unitsFor(part.perUnitRef);
-        const gPart = Math.max(
-          MIN_G,
-          Math.min(MAX_G, Math.round(units * (part.gramsPerUnit || 1)))
-        );
-        if (gPart > 0) {
-          let per100 =
-            findBestFood(part.name) ||
-            HARD_PER100[part.name.toLowerCase()] ||
-            (await fetchOpenFood(req, part.name)) ||
-            null;
+        const gPartRaw = Math.max(MIN_G, Math.min(MAX_G, Math.round(units * (part.gramsPerUnit || 1))));
 
-          // fallback extra: remove marcas/ruídos do nome e tenta de novo
-          if (!per100) {
-            const stripped = stripBrand(part.name);
-            if (stripped && stripped !== part.name) {
-              per100 =
-                findBestFood(stripped) ||
-                HARD_PER100[stripped.toLowerCase()] ||
-                (await fetchOpenFood(req, stripped)) ||
-                null;
-            }
-          }
+        const per100 =
+          findBestFood(part.name) ||
+          hardLookup(part.name) ||
+          (await fetchOpenFood(req, part.name));
+        if (!per100) continue;
 
-          if (per100) {
-            const factor = gPart / 100;
-            totals.p += (per100.protein || 0) * factor;
-            totals.c += (per100.carbs || 0) * factor;
-            totals.f += (per100.fat || 0) * factor;
-            totals.kcal += (per100.calories || 0) * factor;
-          }
-        }
+        const factor = gPartRaw / 100;
+        totals.p += (per100.protein || 0) * factor;
+        totals.c += (per100.carbs || 0) * factor;
+        totals.f += (per100.fat || 0) * factor;
+        totals.kcal += (per100.calories || 0) * factor;
       }
+      outQuantity = normalizeQuantityOut(displayName, quantidade, grams, supplement);
     }
 
     return {
-      nome: originalName,
-      quantidade,
+      nome: displayName,
+      quantidade: outQuantity,
       proteinas: round1(totals.p),
       carboidratos: round1(totals.c),
       gorduras: round1(totals.f),
@@ -581,18 +752,31 @@ async function recalcItemFromDB(
     };
   }
 
-  // 2) Item simples → base local → hard → openfood
-  const per100 =
+  // Item simples → DB → HARD → OpenFood
+  let per100 =
     findBestFood(canonical) ||
-    HARD_PER100[canonical.toLowerCase()] ||
+    hardLookup(canonical) ||
     (await fetchOpenFood(req, canonical)) ||
     null;
 
+  if (!per100) {
+    const stripped = stripBrand(canonical);
+    if (stripped && stripped !== canonical) {
+      per100 =
+        findBestFood(stripped) ||
+        hardLookup(stripped) ||
+        (await fetchOpenFood(req, stripped)) ||
+        null;
+    }
+  }
+
   if (per100) {
-    const factor = grams / 100;
+    const gramsClamped = supplement ? Math.min(40, grams) : grams;
+    const factor = gramsClamped / 100;
+    const outQuantity = normalizeQuantityOut(displayName, quantidade, gramsClamped, supplement);
     return {
-      nome: per100.name,
-      quantidade,
+      nome: displayName,
+      quantidade: outQuantity,
       proteinas: round1((per100.protein || 0) * factor),
       carboidratos: round1((per100.carbs || 0) * factor),
       gorduras: round1((per100.fat || 0) * factor),
@@ -600,10 +784,11 @@ async function recalcItemFromDB(
     };
   }
 
-  // 3) Sem match algum → zera
+  // Sem match algum → zera (mas com unidade normalizada)
+  const outQuantity = normalizeQuantityOut(displayName, quantidade, grams, supplement);
   return {
-    nome: originalName,
-    quantidade,
+    nome: displayName,
+    quantidade: outQuantity,
     proteinas: 0,
     carboidratos: 0,
     gorduras: 0,
@@ -615,25 +800,12 @@ function canonicalizeName(s: string) {
   return normalizeStr(s).replace(/\s+/g, " ").trim();
 }
 
-// Usa a sua tabela de regex ALIAS (já existente no arquivo)
 function applyRegexAlias(raw: string): string | null {
   const hit = ALIAS.find(a => a.rx.test(raw));
   return hit ? hit.canon : null;
 }
 
-// Garante que o nome final é genérico: remove marca → aplica alias de regex → aplica FOOD_ALIASES → fallback
-function resolveToGenericName(rawName: string): string {
-  const stripped = stripBrand(rawName);                 // remove "Wickbold", "Adria", "Nesfit", tamanhos, etc.
-  const fromRegex = applyRegexAlias(stripped);          // ex.: "torrada integral com abacate" → "pão integral" + "abacate" (quando composto)
-  if (fromRegex) return fromRegex;
-  const canon = canonicalizeName(stripped);
-  const aliased = FOOD_ALIASES[canon] ?? cannonToPlain(canon);
-  return aliased;
-}
-
-// Faz pequenos ajustes “plain” (ex.: plural/sinônimos simples) sem amarrar em marca
 function cannonToPlain(c: string): string {
-  // exemplos práticos de normalização leve
   if (/p[aã]o de forma/.test(c)) return "pão de forma";
   if (/p[aã]o integral/.test(c)) return "pão integral";
   if (/p[aã]o.*sem gl[uú]ten/.test(c)) return "pão sem glúten";
@@ -642,6 +814,67 @@ function cannonToPlain(c: string): string {
   if (/clara.*ovo/.test(c)) return "clara de ovo pasteurizada";
   return c;
 }
+
+async function ensureLunchMin4(
+  req: NextRequest,
+  planIn: Refeicao[],
+  prefs: Prefs
+): Promise<Refeicao[]> {
+  const plan = JSON.parse(JSON.stringify(planIn)) as Refeicao[];
+  const allow = (name: string) => {
+    const flags = classify(name);
+    if (shouldRemoveByDietType(flags, prefs)) return false;
+    if (
+      (prefs.avoidCategories.dairy && flags.dairy) ||
+      (prefs.avoidCategories.eggs && flags.eggs) ||
+      (prefs.avoidCategories.pork && flags.pork) ||
+      (prefs.avoidCategories.seafood && flags.seafood) ||
+      (prefs.avoidCategories.shellfish && flags.shellfish) ||
+      (prefs.avoidCategories.meat && flags.meat) ||
+      (prefs.avoidCategories.poultry && flags.poultry) ||
+      (prefs.avoidCategories.alcohol && flags.alcohol) ||
+      (prefs.avoidCategories.gluten && flags.gluten) ||
+      (prefs.avoidCategories.nuts && flags.nuts)
+    ) return false;
+    if (matchesWordList(name, prefs.avoidIngredients)) return false;
+    if (matchesWordList(name, prefs.dislikeIngredients)) return false;
+    return true;
+  };
+
+  const lunchIdx = plan.findIndex(r => /almoc|almo[cç]o/.test(normalizeStr(r.refeicao)));
+  if (lunchIdx < 0) return plan;
+
+  const lunch = plan[lunchIdx];
+  if ((lunch.alimentos?.length ?? 0) >= 4) return plan;
+
+  // candidatos baixos em carbo/fat
+  const candidates: Array<{ nome: string; quantidade: string }> = [
+    { nome: "alface",           quantidade: "50 g" },
+    { nome: "brócolis cozido",  quantidade: "90 g" },
+    { nome: "cenoura",          quantidade: "80 g" },
+    { nome: "legumes variados", quantidade: "120 g" },
+  ].filter(i => allow(i.nome));
+
+  const hasName = (n: string) =>
+    lunch.alimentos.some(a => canonicalizeName(a.nome) === canonicalizeName(n));
+
+  for (const cand of candidates) {
+    if (lunch.alimentos.length >= 4) break;
+    if (hasName(cand.nome)) continue;
+    lunch.alimentos.push(await recalcItemFromDB(req, cand.nome, cand.quantidade));
+  }
+  plan[lunchIdx] = lunch;
+  return plan;
+}
+
+function resolveToGenericName(rawName: string): string {
+  const stripped = stripBrand(rawName);        // remove marcas/embalagens
+  const fromRegex = applyRegexAlias(stripped); // aplica aliases (ex.: Wickbold → pão integral)
+  if (fromRegex) return fromRegex;
+  const canon = canonicalizeName(stripped);
+  return cannonToPlain(canon);                 // “embelezamento” (ex.: pao integral → pão integral)
+}
+
 
 function sanitizePlanNames(rawParsed: any): { refeicao: string; alimentos: { nome: string; quantidade: string }[] }[] {
   const arr = normalizeFoodsJson(rawParsed);
@@ -656,15 +889,11 @@ function sanitizePlanNames(rawParsed: any): { refeicao: string; alimentos: { nom
       const rawNome = String(a?.nome ?? "").trim();
       const quantidade = String(a?.quantidade ?? "").trim();
       if (!rawNome || !quantidade) continue;
-
-      // 🔴 força genérico aqui
       const nomeGenerico = resolveToGenericName(rawNome);
       alimentosOut.push({ nome: nomeGenerico, quantidade });
     }
 
-    if (refeicao && alimentosOut.length > 0) {
-      out.push({ refeicao, alimentos: alimentosOut });
-    }
+    if (refeicao && alimentosOut.length > 0) out.push({ refeicao, alimentos: alimentosOut });
   }
   return out;
 }
@@ -789,16 +1018,11 @@ function prefsFromMessages(messages: any[]): Partial<Prefs> {
   else if (/halal/.test(txt)) out.dietType = "halal";
   else if (/kosher|kash/.test(txt)) out.dietType = "kosher";
 
-  if (/(intolerante a lactose|intoler[âa]ncia? a? lactose|sem lactose|sem latic[ií]nios)/.test(txt)) {
-    out.avoidCategories!.dairy = true;
-  }
-  if (/(intolerante a gl[uú]ten|intoler[âa]ncia? a? gl[uú]ten|cel[ií]ac[oa]|sem gl[uú]ten)/.test(txt)) {
-    out.avoidCategories!.gluten = true;
-  }
+  if (/(intolerante a lactose|intoler[âa]ncia? a? lactose|sem lactose|sem latic[ií]nios)/.test(txt)) out.avoidCategories!.dairy = true;
+  if (/(intolerante a gl[uú]ten|intoler[âa]ncia? a? gl[uú]ten|cel[ií]ac[oa]|sem gl[uú]ten)/.test(txt)) out.avoidCategories!.gluten = true;
   if (/sem ovos?/.test(txt)) out.avoidCategories!.eggs = true;
   if (/sem porco|no pork|sem carne de porco/.test(txt)) out.avoidCategories!.pork = true;
-  if (/al[eé]rgico a? nuts|al[eé]rgico a? nozes|al[eé]rgico a? amendoim|sem oleaginosas/.test(txt))
-    out.avoidCategories!.nuts = true;
+  if (/al[eé]rgico a? nuts|al[eé]rgico a? nozes|al[eé]rgico a? amendoim|sem oleaginosas/.test(txt)) out.avoidCategories!.nuts = true;
 
   const dislikeMatch = txt.match(/n[aã]o gosto de ([^.\n;]+)/g);
   if (dislikeMatch) for (const m of dislikeMatch) out.dislikeIngredients!.push(m.replace(/n[aã]o gosto de /, "").trim());
@@ -871,14 +1095,14 @@ function applyPreferences(planIn: Refeicao[], prefs: Prefs): Refeicao[] {
       if (matchesWordList(a.nome, prefs.avoidIngredients)) continue;
       if (matchesWordList(a.nome, prefs.dislikeIngredients)) continue;
 
-      // troca whey/caseína/soro por isolado vegetal
+      // troca whey/caseína por isolado vegetal quando necessário
       if (/(whey|case[ií]na|soro de leite)/i.test(a.nome) &&
           (prefs.dietType === "vegan" || prefs.dietType === "vegetarian" || prefs.avoidCategories.dairy || prefs.avoidCategories.gluten)) {
         const grams = 30;
         const SOY_P = 27/30, SOY_C = 1/30, SOY_F = 1/30;
         const addP = round1(grams * SOY_P), addC = round1(grams * SOY_C), addF = round1(grams * SOY_F);
         const kcal = Math.round(addP * 4 + addC * 4 + addF * 9);
-        kept.push({ nome: "Proteína isolada de soja (sem lactose e sem glúten)", quantidade: `${grams}g`,
+        kept.push({ nome: "Proteína isolada de soja (sem lactose e sem glúten)", quantidade: `${grams} g`,
           proteinas: addP, carboidratos: addC, gorduras: addF, calorias: kcal });
         continue;
       }
@@ -905,7 +1129,7 @@ function enforceMealSuitability(planIn: Refeicao[]): Refeicao[] {
 }
 
 /* ================================
-   Ajuste final (foco proteína)
+   Ajuste final (prioriza proteína)
 ================================ */
 type Booster = { nome: string; p_per_g: number; c_per_g: number; f_per_g: number; allowed: (prefs: Prefs) => boolean; };
 function getProteinBoosters(prefs: Prefs): Booster[] {
@@ -925,122 +1149,107 @@ function totalGramsOf(plan: Refeicao[], itemName: string) {
   }
   return g;
 }
-function adjustPlanToTargets(
+
+async function adjustPlanToTargets(
+  req: NextRequest,
   planIn: Refeicao[],
   targets: { protein: number; carbs: number; fat: number },
   prefs: Prefs
-) {
+): Promise<Refeicao[]> {
   const plan = JSON.parse(JSON.stringify(planIn)) as Refeicao[];
+  const boosters = getProteinBoosters(prefs); // ordem já favorece "clara" (0C/0F) quando permitido
 
-  let adjIdx = plan.findIndex((r) => /ajustes do dia|suplementos/i.test(r.refeicao));
-  if (adjIdx === -1) { plan.push({ refeicao: "Ajustes do Dia", alimentos: [] as any }); adjIdx = plan.length - 1; }
-  const ajustes = plan[adjIdx].alimentos as any[];
-
-  let { protein, carbs, fat } = sumMacros(plan);
-  const minProtein = targets.protein;
-  const maxProtein = round1(targets.protein * 1.05);
-
-  if (protein < minProtein) {
-    const boosters = getProteinBoosters(prefs).sort((a, b) => {
-      const az = (a.c_per_g === 0 && a.f_per_g === 0) ? -1 : 0;
-      const bz = (b.c_per_g === 0 && b.f_per_g === 0) ? -1 : 0;
-      if (az !== bz) return az - bz;
-      return (a.c_per_g - b.c_per_g) || (a.f_per_g - b.f_per_g);
-    });
-
-    for (const b of boosters) {
-      if (protein >= minProtein) break;
-
-      const needP = Math.max(0, maxProtein - protein);
-      if (needP <= 0) break;
-
-      const carbRoom = Math.max(0, targets.carbs - carbs);
-      const fatRoom  = Math.max(0, targets.fat   - fat);
-
-      const gramsByP = needP / b.p_per_g;
-      const gramsByC = b.c_per_g > 0 ? (carbRoom / b.c_per_g) : Number.POSITIVE_INFINITY;
-      const gramsByF = b.f_per_g > 0 ? (fatRoom  / b.f_per_g) : Number.POSITIVE_INFINITY;
-      const gByMax   = Math.floor((maxProtein - protein) / b.p_per_g);
-
-      const already = totalGramsOf(plan, b.nome);
-      const capacityLeft = Math.max(0, 250 - already);
-
-      let grams: number;
-      if (b.c_per_g === 0 && b.f_per_g === 0) {
-        const gToHitMin = Math.ceil((minProtein - protein) / b.p_per_g);
-        const gToStayMax = Math.floor((maxProtein - protein) / b.p_per_g);
-        grams = Math.max(0, Math.min(gToHitMin, gToStayMax, capacityLeft));
-      } else {
-        grams = Math.floor(Math.max(0, Math.min(gramsByP, gramsByC, gramsByF, gByMax, capacityLeft)));
-      }
-      grams = Math.min(grams, 250);
-
-      if (grams > 0) {
-        const addP = round1(grams * b.p_per_g);
-        const addC = round1(grams * b.c_per_g);
-        const addF = round1(grams * b.f_per_g);
-        const kcal = Math.round(addP * 4 + addC * 4 + addF * 9);
-
-        ajustes.push({ nome: b.nome, quantidade: `${grams}g`, proteinas: addP, carboidratos: addC, gorduras: addF, calorias: kcal });
-        protein = round1(protein + addP);
-        carbs   = round1(carbs + addC);
-        fat     = round1(fat + addF);
-      }
-    }
-
-    // fallback zero C/F se ainda abaixo
-    if (protein < minProtein) {
-      const zeroCF = getProteinBoosters(prefs).find(b => b.c_per_g === 0 && b.f_per_g === 0);
-      if (zeroCF) {
-        const already = totalGramsOf(plan, zeroCF.nome);
-        const capacityLeft = Math.max(0, 250 - already);
-        const gToHitMin = Math.ceil((minProtein - protein) / zeroCF.p_per_g);
-        const gToStayMax = Math.floor((maxProtein - protein) / zeroCF.p_per_g);
-        let grams = Math.max(0, Math.min(gToHitMin, gToStayMax, capacityLeft));
-        grams = Math.min(grams, 250);
-        if (grams > 0) {
-          const addP = round1(grams * zeroCF.p_per_g);
-          const kcal = Math.round(addP * 4);
-          ajustes.push({ nome: zeroCF.nome, quantidade: `${round1(grams)}g`, proteinas: addP, carboidratos: 0, gorduras: 0, calorias: kcal });
-          protein = round1(protein + addP);
-        }
-      }
-    }
+  function mealOrder(r: Refeicao[]) {
+    // tentativa de ordem natural das refeições
+    const score = (name: string) => {
+      const n = normalizeStr(name);
+      if (/cafe.*manha/.test(n)) return 0;
+      if (/lanche.*manha/.test(n)) return 1;
+      if (/almoc|almo[cç]o/.test(n)) return 2;
+      if (/lanche.*tarde/.test(n)) return 3;
+      if (/jantar/.test(n)) return 4;
+      return 5;
+    };
+    return [...r].sort((a, b) => score(a.refeicao) - score(b.refeicao));
   }
 
-  // gordura
-  let needFat = round1(Math.max(0, targets.fat - fat));
-  if (needFat > 0) {
-    const allowed = Math.min(needFat, 250 - totalGramsOf(plan, "Azeite de oliva extra virgem"));
-    const addG = Math.max(0, Math.min(allowed, 250));
-    if (addG > 0) {
-      const kcal = Math.round(addG * 9);
-      ajustes.push({ nome: "Azeite de oliva extra virgem", quantidade: `${round1(addG)}g`,
-        proteinas: 0, carboidratos: 0, gorduras: round1(addG), calorias: kcal });
-      fat = round1(fat + addG);
-    }
-  }
+  const meals = mealOrder(plan);
 
-  // carbo
-  let needCarb = round1(Math.max(0, targets.carbs - carbs));
-  if (needCarb > 0) {
-    const allowed = Math.min(needCarb, 250 - totalGramsOf(plan, "Maltodextrina"));
-    const addG = Math.max(0, Math.min(allowed, 250));
-    if (addG > 0) {
-      const kcal = Math.round(addG * 4);
-      ajustes.push({ nome: "Maltodextrina", quantidade: `${round1(addG)}g`,
-        proteinas: 0, carboidratos: round1(addG), gorduras: 0, calorias: kcal });
-      carbs = round1(carbs + addG);
+  let totals = sumMacros(plan);
+  let guard = 0;
+
+  while (totals.protein < targets.protein && guard++ < 20) {
+    const protDeficit = Math.max(0, targets.protein - totals.protein);
+    // Capacidade restante de C e F para não ultrapassar
+    const carbRoom = Math.max(0, targets.carbs - totals.carbs);
+    const fatRoom  = Math.max(0, targets.fat   - totals.fat);
+
+    let addedSomething = false;
+
+    for (const meal of meals) {
+      if (totals.protein >= targets.protein) break;
+
+      for (const b of boosters) {
+        const isSupp = /prote[ií]na isolada|bcaa|glutamina|creatina|maltodextrina|dextrose/i.test(b.nome);
+        const dayUsed = totalGramsOf(plan, b.nome);
+        const dayCap  = Math.max(0, 250 - dayUsed);
+        if (dayCap <= 0) continue;
+
+        // limite por refeição
+        const mealUsed = meal.alimentos.reduce((acc, a) => {
+          if (new RegExp(b.nome, "i").test(a.nome)) {
+            const m = String(a.quantidade).match(/(-?\d+(?:[.,]\d+)?)\s*g\b/);
+            if (m) acc += toNumber(m[1]);
+          }
+          return acc;
+        }, 0);
+        const mealCap = Math.max(0, (isSupp ? 40 : 200) - mealUsed);
+        if (mealCap <= 0) continue;
+
+        // g necessários para bater a proteína…
+        const gForProtein = Math.ceil(protDeficit / (b.p_per_g || 0.0001)); // evita /0
+        let gAllowedByCF = Infinity as number;
+
+        if (b.c_per_g > 0) gAllowedByCF = Math.min(gAllowedByCF, Math.floor(carbRoom / b.c_per_g));
+        if (b.f_per_g > 0) gAllowedByCF = Math.min(gAllowedByCF, Math.floor(fatRoom  / b.f_per_g));
+        if (!Number.isFinite(gAllowedByCF)) gAllowedByCF = gForProtein; // clara de ovo → 0C/0F
+
+        let gramsToAdd = Math.max(0, Math.min(gForProtein, gAllowedByCF, dayCap, mealCap));
+        if (gramsToAdd <= 0) continue;
+
+        // arredonda para algo razoável
+        if (isSupp) gramsToAdd = Math.min(40, Math.max(10, Math.round(gramsToAdd / 5) * 5));
+        else gramsToAdd = Math.max(30, Math.round(gramsToAdd / 10) * 10);
+
+        // segurança final para não exceder C/F
+        const addC = (b.c_per_g || 0) * gramsToAdd;
+        const addF = (b.f_per_g || 0) * gramsToAdd;
+        if (totals.carbs + addC > targets.carbs + 1e-6) continue;
+        if (totals.fat   + addF > targets.fat   + 1e-6) continue;
+
+        // adiciona item calculado via banco (mantém consistência de macros)
+        const newItem = await recalcItemFromDB(req, b.nome, `${gramsToAdd} g`);
+        meal.alimentos.push(newItem);
+
+        // atualiza totais
+        totals = sumMacros(plan);
+        addedSomething = true;
+        if (totals.protein >= targets.protein) break;
+      }
+      if (totals.protein >= targets.protein) break;
     }
+
+    if (!addedSomething) break; // não conseguiu adicionar mais nada sem estourar C/F
   }
 
   return plan;
 }
 
+
 /* ================================
    Firestore: metas estritas
 ================================ */
-async function getUserMeta(email: string): Promise<{ proteina: number; carboidrato: number; gordura: number } | null> {
+async function getUserMeta(email: string): Promise<{ proteina: number; carbo: number; gordura: number } | null> {
   try {
     const metasRef: any = collection(db, "chatfit", email, "metasusuario");
     const snap = await metasRef.orderBy("createdAt", "desc").limit(1).get();
@@ -1050,7 +1259,7 @@ async function getUserMeta(email: string): Promise<{ proteina: number; carboidra
     const carboidrato = toNumber(data.carboidrato);
     const gordura = toNumber(data.gordura);
     if (proteina <= 0 || carboidrato <= 0 || gordura <= 0) return null;
-    return { proteina, carboidrato, gordura };
+    return { proteina, carbo: carboidrato, gordura };
   } catch (err) {
     console.error("Erro ao buscar metas do usuário:", err);
     return null;
@@ -1086,7 +1295,7 @@ export async function POST(req: NextRequest) {
     const prefsMsg = prefsFromMessages(messages);
     const prefs = mergePrefs(prefsDoc, prefsMsg);
 
-    // prompt
+    // linhas das preferências para prompt
     const prefsLines: string[] = [];
     if (prefs.dietType && prefs.dietType !== "omnivore") prefsLines.push(`- Estilo: ${prefs.dietType}`);
     const catMap = {
@@ -1099,63 +1308,60 @@ export async function POST(req: NextRequest) {
     if (prefs.avoidIngredients.length) prefsLines.push(`- Evitar: ${prefs.avoidIngredients.join(", ")}`);
     if (prefs.dislikeIngredients.length) prefsLines.push(`- Não gosto: ${prefs.dislikeIngredients.join(", ")}`);
 
-    const systemPrompt = `
-    Você deve gerar um plano alimentar de 1 dia, seguindo METAS e PREFERÊNCIAS **sem citar marcas**.
-
-    ***REGRAS IMPORTANTES***
-    - Use APENAS **nomes genéricos de alimentos**, sem marca (ex.: "pão integral", "queijo minas", "iogurte de soja").
-    - Se o usuário tiver restrições (ex.: sem lactose/glúten/vegano/vegetariano), **NÃO** use whey/caseína/soro de leite; prefira proteína vegetal isolada.
-    - Café da Manhã: evite pratos típicos de almoço/jantar (ex.: arroz/feijão).
-    - Cada refeição deve ter **no mínimo 2 itens**.
-    - Limite por item **≤ 250g**. Se usar medidas caseiras, informe **quantidade + unidade** (g, ml, fatia, colher de sopa, xícara, unidade).
-    - Preencha **proteínas, carboidratos, gorduras e calorias** de cada item (valores > 0).
-    - **Priorize bater a PROTEÍNA** (pode passar até +5%). Carboidrato e gordura **não podem ultrapassar** as metas.
-    - Se faltar proteína, complemente com **proteína vegetal isolada** (ex.: soja/ervilha). 
-    - Se faltar gordura, **azeite de oliva extra virgem**. Se faltar carboidrato, **maltodextrina**.
-
-    METAS (Firestore):
-    - Proteína: ${userMeta.proteina}g (PRIORIDADE: atingir; pode passar até +5%)
-    - Carboidratos: ${userMeta.carboidrato}g (NÃO ultrapassar)
-    - Gordura: ${userMeta.gordura}g (NÃO ultrapassar)
-
-    PREFERÊNCIAS DO USUÁRIO:
-    ${prefsLines.length ? prefsLines.join("\n") : "- (Nenhuma explícita)"}
-
-    RETORNO OBRIGATÓRIO:
-    - **Apenas** o bloco <FOODS_JSON>...</FOODS_JSON> contendo um **ARRAY JSON** no formato:
-    <FOODS_JSON>[
-      {
-        "refeicao": "Café da Manhã",
-        "alimentos": [
-          {"nome": "pão integral", "quantidade": "2 fatias", "proteinas": 8, "carboidratos": 30, "gorduras": 2, "calorias": 160},
-          {"nome": "ovo de galinha", "quantidade": "2 unidades", "proteinas": 12, "carboidratos": 2, "gorduras": 10, "calorias": 140}
-        ]
-      }
-    ]</FOODS_JSON>
-    `.trim();
-
-
+    // prompt (arquivo)
+    const dietBase = readPromptFile("dietplanner.txt");
+    const systemPrompt = buildDietSystemPrompt(
+      dietBase,
+      { proteina: userMeta.proteina, carbo: userMeta.carbo, gordura: userMeta.gordura },
+      prefsLines
+    );
     const openAIMessages = [{ role: "system", content: systemPrompt }, ...messages];
 
-    // OpenAI
+    // chamada OpenAI (sem temperature)
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: JSON.stringify({ model: "gpt-4o", messages: openAIMessages, max_tokens: 1800, temperature: 0.2 }),
+      body: JSON.stringify({
+        model: DIET_MODEL, // "gpt-5" por default (via env DIET_MODEL se quiser trocar)
+        messages: openAIMessages,
+        max_completion_tokens: 1800,
+      }),
     });
 
     if (!response.ok) {
       const txt = await response.text().catch(() => "");
       console.error("[OpenAI] HTTP error:", response.status, response.statusText, txt);
-      return NextResponse.json({ error: "Falha na geração do plano." }, { status: 502 });
+      // Tenta um fallback 100% local mesmo se a API falhar
+      let plan = await buildFallbackPlan(req, prefs);
+      if (!plan.length) {
+        return NextResponse.json({ error: "Falha na geração do plano e fallback vazio." }, { status: 502 });
+      }
+      const groupedPlan = plan;
+      const totals = sumMacros(groupedPlan);
+      const content = renderGroupedPlan(groupedPlan, totals);
+      await setDoc(
+        doc(db, "chatfit", userEmail, "planos", "dieta"),
+        {
+          content, alimentos: groupedPlan, updatedAt: new Date().toISOString(), totals,
+          meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+          prefs, source: "fallback-local", prompt: "src/ai/prompts/dietplanner.txt"
+        } as any,
+        { merge: false } as any
+      );
+      return NextResponse.json({
+        reply: content, alimentos: groupedPlan, totals,
+        meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+        prefs, source: "fallback-local", prompt: "src/ai/prompts/dietplanner.txt"
+      });
     }
+
     const data = await response.json().catch(() => ({} as any));
     if (data?.error) {
       console.error("[OpenAI] API error:", data.error);
       return NextResponse.json({ error: "Falha na geração do plano." }, { status: 502 });
     }
 
-    // Parse do LLM (pega NOME/QUANTIDADE)
+    // Parse do LLM
     const rawContent: string = data?.choices?.[0]?.message?.content ?? "[]";
     const foodsBlock = extractFoodsBlock(rawContent);
     let planNames: { refeicao: string; alimentos: { nome: string; quantidade: string }[] }[];
@@ -1164,42 +1370,67 @@ export async function POST(req: NextRequest) {
       planNames = sanitizePlanNames(parsedRaw);
     } catch (err) {
       console.error("Erro de parse JSON do LLM:", err, foodsBlock);
-      return NextResponse.json({ error: "Plano retornado em formato inválido." }, { status: 422 });
+      // mesmo assim, tenta fallback local
+      let plan = await buildFallbackPlan(req, prefs);
+      if (!plan.length) {
+        return NextResponse.json({ error: "Plano retornado em formato inválido e fallback vazio." }, { status: 422 });
+      }
+      const groupedPlan = plan;
+      const totals = sumMacros(groupedPlan);
+      const content = renderGroupedPlan(groupedPlan, totals);
+      await setDoc(
+        doc(db, "chatfit", userEmail, "planos", "dieta"),
+        {
+          content, alimentos: groupedPlan, updatedAt: new Date().toISOString(), totals,
+          meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+          prefs, source: "fallback-local-parse", prompt: "src/ai/prompts/dietplanner.txt"
+        } as any,
+        { merge: false } as any
+      );
+      return NextResponse.json({
+        reply: content, alimentos: groupedPlan, totals,
+        meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+        prefs, source: "fallback-local-parse", prompt: "src/ai/prompts/dietplanner.txt"
+      });
     }
 
-    // (1) Recalcula com base local + hard + openfood
+    // 1) Recalcula com base local + hard + openfood
     let plan = await rebuildPlanWithDB(req, planNames);
 
-    // (2) Preferências
+    // 2) Preferências
     plan = applyPreferences(plan, prefs);
 
-    // (3) Suitability
+    // 3) Suitability (ex.: café sem arroz/feijão)
     plan = enforceMealSuitability(plan);
 
-    // (4) Estrutura mínima se necessário
-    if (!plan.length) {
-      plan = [
-        { refeicao: "Café da Manhã", alimentos: [] as any },
-        { refeicao: "Almoço", alimentos: [] as any },
-        { refeicao: "Lanche da Tarde", alimentos: [] as any },
-        { refeicao: "Jantar", alimentos: [] as any },
-      ];
-    }
+    // 3.1) Almoço precisa ter no mínimo 4 itens
+    plan = await ensureLunchMin4(req, plan, prefs);
 
-    // (5) Ajuste final (proteína primeiro; clamps 250 g por item)
-    plan = adjustPlanToTargets(
-      plan,
-      { protein: userMeta.proteina, carbs: userMeta.carboidrato, fat: userMeta.gordura },
-      prefs
-    );
+    // 3.2) Bater meta de PROTEÍNA sem ultrapassar CARBO/GORDURA
+    plan = await adjustPlanToTargets(
+    req,
+    plan,
+    { protein: userMeta.proteina, carbs: userMeta.carbo, fat: userMeta.gordura },
+    prefs
+);
 
-    // Validação final
+
+    // 4) Garante que não está vazio (fallback)
+    plan = await ensureNonEmptyPlan(req, plan, prefs);
+
+    // 5) Validação final (Zod)
     let groupedPlan: Refeicao[];
     try {
       groupedPlan = PlanoSchema.parse(plan.filter((r) => r.alimentos.length > 0));
     } catch (err) {
       console.error("Erro de validação final do plano:", err);
-      return NextResponse.json({ error: "Plano final inválido." }, { status: 422 });
+      // última tentativa: fallback duro
+      const fb = await buildFallbackPlan(req, prefs);
+      try {
+        groupedPlan = PlanoSchema.parse(fb.filter((r) => r.alimentos.length > 0));
+      } catch (err2) {
+        return NextResponse.json({ error: "Plano final inválido (mesmo com fallback)." }, { status: 422 });
+      }
     }
 
     const totals = sumMacros(groupedPlan);
@@ -1210,19 +1441,126 @@ export async function POST(req: NextRequest) {
       doc(db, "chatfit", userEmail, "planos", "dieta"),
       {
         content, alimentos: groupedPlan, updatedAt: new Date().toISOString(), totals,
-        meta: { proteina: userMeta.proteina, carboidrato: userMeta.carboidrato, gordura: userMeta.gordura },
-        prefs, source: "alimentos_br.json|hard-fallback|openfood",
-      },
+        meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+        prefs, source: "alimentos_br.json|hard-fallback|openfood", prompt: "src/ai/prompts/dietplanner.txt"
+      } as any,
       { merge: false } as any
     );
 
     return NextResponse.json({
       reply: content, alimentos: groupedPlan, totals,
-      meta: { proteina: userMeta.proteina, carboidrato: userMeta.carboidrato, gordura: userMeta.gordura },
-      prefs, source: "alimentos_br.json|hard-fallback|openfood",
+      meta: { proteina: userMeta.proteina, carboidrato: userMeta.carbo, gordura: userMeta.gordura },
+      prefs, source: "alimentos_br.json|hard-fallback|openfood", prompt: "src/ai/prompts/dietplanner.txt"
     });
   } catch (err: any) {
     console.error("Erro inesperado no endpoint:", err);
     return NextResponse.json({ error: "Erro inesperado: " + (err?.message || "") }, { status: 500 });
   }
+}
+
+async function buildFallbackPlan(
+  req: NextRequest,
+  prefs: Prefs
+): Promise<Refeicao[]> {
+  // helpers simples
+  const allow = (name: string) => {
+    const flags = classify(name);
+    if (shouldRemoveByDietType(flags, prefs)) return false;
+    if (
+      (prefs.avoidCategories.dairy && flags.dairy) ||
+      (prefs.avoidCategories.eggs && flags.eggs) ||
+      (prefs.avoidCategories.pork && flags.pork) ||
+      (prefs.avoidCategories.seafood && flags.seafood) ||
+      (prefs.avoidCategories.shellfish && flags.shellfish) ||
+      (prefs.avoidCategories.meat && flags.meat) ||
+      (prefs.avoidCategories.poultry && flags.poultry) ||
+      (prefs.avoidCategories.alcohol && flags.alcohol) ||
+      (prefs.avoidCategories.gluten && flags.gluten) ||
+      (prefs.avoidCategories.nuts && flags.nuts)
+    ) return false;
+    if (matchesWordList(name, prefs.avoidIngredients)) return false;
+    if (matchesWordList(name, prefs.dislikeIngredients)) return false;
+    return true;
+  };
+
+  // escolhas condicionais simples
+  const proteinA = allow("peito de frango") ? "peito de frango"
+                 : allow("tofu") ? "tofu"
+                 : allow("ovo de galinha") ? "ovo de galinha"
+                 : "tofu";
+  const proteinB = allow("tofu") ? "tofu"
+                 : allow("peito de frango") ? "peito de frango"
+                 : allow("ovo de galinha") ? "ovo de galinha"
+                 : "tofu";
+
+  const snackProtein = "proteína isolada de soja (sem lactose e sem glúten)"; // sempre genérico e <= 40g
+
+  // Itens por refeição (somente unidades permitidas: g | unid | colher de sopa)
+  const planNames: { refeicao: string; alimentos: { nome: string; quantidade: string }[] }[] = [
+    {
+      refeicao: "Café da Manhã",
+      alimentos: allow("ovo de galinha")
+        ? [
+            { nome: "pão integral",     quantidade: "2 unid" }, // tratado como fatias de 25 g cada
+            { nome: "ovo de galinha",   quantidade: "2 unid" },
+          ]
+        : [
+            { nome: "pão integral",       quantidade: "2 unid" },
+            { nome: "pasta de amendoim",  quantidade: "1 colher de sopa" },
+          ],
+    },
+    {
+      refeicao: "Lanche da Manhã",
+      alimentos: [
+        { nome: "banana",             quantidade: "1 unid" },
+        { nome: "pasta de amendoim",  quantidade: "1 colher de sopa" },
+      ].filter(i => allow(i.nome)),
+    },
+    {
+      refeicao: "Almoço",
+      alimentos: [
+        { nome: proteinA,                quantidade: "150 g" },
+        { nome: "arroz integral cozido", quantidade: "120 g" },
+        { nome: "legumes variados",      quantidade: "150 g" },
+      ].filter(i => allow(i.nome)),
+    },
+    {
+      refeicao: "Lanche da Tarde",
+      alimentos: [
+        { nome: snackProtein, quantidade: "30 g" }, // suplementos já clampam ≤ 40 g
+        { nome: "banana",     quantidade: "1 unid" },
+      ].filter(i => allow(i.nome)),
+    },
+    {
+      refeicao: "Jantar",
+      alimentos: [
+        { nome: proteinB,            quantidade: "150 g" },
+        { nome: "quinoa cozida",     quantidade: "100 g" },
+        { nome: "legumes variados",  quantidade: "150 g" },
+      ].filter(i => allow(i.nome)),
+    },
+  ];
+
+  // recalcula com DB/openfood e remove refeição vazia
+  const out: Refeicao[] = [];
+  for (const ref of planNames) {
+    const itens: any[] = [];
+    for (const a of ref.alimentos) {
+      itens.push(await recalcItemFromDB(req, a.nome, a.quantidade));
+    }
+    if (itens.length) out.push({ refeicao: ref.refeicao, alimentos: itens });
+  }
+  return out.length ? out : []; // pode retornar [] e quem chama decide último fallback
+}
+
+async function ensureNonEmptyPlan(
+  req: NextRequest,
+  plan: Refeicao[],
+  prefs: Prefs
+): Promise<Refeicao[]> {
+  const nonEmpty = plan.filter(r => r.alimentos && r.alimentos.length > 0);
+  if (nonEmpty.length) return nonEmpty;
+  // constrói um plano genérico válido
+  const fallback = await buildFallbackPlan(req, prefs);
+  return fallback.length ? fallback : nonEmpty; // ainda tenta retornar []
 }

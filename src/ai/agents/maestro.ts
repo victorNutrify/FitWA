@@ -80,35 +80,44 @@ export function classifyIntentHeuristic(
   return "unknown";
 }
 
-// Classificador LLM (fallback) usando seu router.txt
-async function classifyIntentLLM(args: {
-  caller: any; // openAIChatCaller
-  openAIApiKey: string;
-  text: string;
-}): Promise<AgentDomain> {
-  const SYS = loadPromptTxt("router.txt");
-  const { caller, openAIApiKey, text } = args;
+// dentro de maestro.ts
+async function classifyIntentLLM(input: string, caller: LLMCaller): Promise<AgentDomain> {
+  const prompt = [
+    { role: "system", content: "Você é um roteador de intenções." },
+    { role: "user", content: input }
+  ];
 
   const res = await caller({
-    apiKey: openAIApiKey,
-    model: "gpt-4o-mini",
-    temperature: 0.0,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: SYS || "Classifique a intenção: food|exercise|diet|recipes|shopping|unknown. Responda em JSON: {\"domain\":\"...\"}" },
-      { role: "user", content: text || "classifique a intenção." },
-    ],
+    model: process.env.ROUTER_MODEL ?? "gpt-4o-mini",
+    messages: prompt,
+    // se você já carrega o router.txt aqui, mantenha como está
   });
 
-  try {
-    const obj = res.json ?? JSON.parse(res.text);
-    const d = String(obj?.domain || "").toLowerCase();
-    if (["food", "exercise", "diet", "recipes", "shopping", "unknown"].includes(d)) {
-      return d as AgentDomain;
-    }
-  } catch {
-    // ignora e cai no fallback
+  let obj: any = res.json;
+  if (!obj) {
+    try { obj = JSON.parse(res.text as string); } catch { return "unknown"; }
   }
+
+  // SUPORTA seus dois formatos: { "domain": "..." } OU { "intents": [...] }
+  if (obj?.domain) {
+    const d = String(obj.domain).toLowerCase();
+    if (["food","exercise","diet","recipes","shopping","unknown"].includes(d)) return d as AgentDomain;
+  }
+
+  if (Array.isArray(obj?.intents) && obj.intents.length) {
+    // mapeia seus rótulos PT-BR -> domínios internos
+    const map: Record<string, AgentDomain> = {
+      "alimentos": "food",
+      "exercicios": "exercise",
+      "plano": "diet",
+      "compras": "shopping",
+      "visao": "food",     // mensagens com foto vão cair no food
+      "dicas": "unknown"
+    };
+    const first = String(obj.intents[0] ?? "").toLowerCase();
+    return map[first] ?? "unknown";
+  }
+
   return "unknown";
 }
 
