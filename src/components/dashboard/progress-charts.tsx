@@ -44,6 +44,54 @@ function getDiaAtual() {
   return local.toISOString().slice(0, 10);
 }
 
+// Helpers para exercício
+function extractMinutes(dur?: string): number {
+  if (!dur) return 0;
+  let min = 0;
+  const h = dur.match(/(\d+)\s*h/);
+  if (h) min += parseInt(h[1], 10) * 60;
+  const m = dur.match(/(\d+)\s*min/);
+  if (m) min += parseInt(m[1], 10);
+  return min;
+}
+function numberish(n: any): number {
+  if (typeof n === "number") return isFinite(n) ? n : 0;
+  if (typeof n === "string") {
+    const m = n.match(/-?\d+(\.\d+)?/);
+    return m ? parseFloat(m[0]) : 0;
+  }
+  return 0;
+}
+// METs bem simples por tipo
+const METS: Record<string, number> = {
+  corrida: 9.8,
+  correr: 9.8,
+  caminhada: 3.5,
+  bike: 7.5,
+  bicicleta: 7.5,
+  spinning: 8.0,
+  tenis: 7.3,
+  "tênis": 7.3,
+  natacao: 8.0,
+  natação: 8.0,
+  hiit: 10.0,
+  musculacao: 6.0,
+  musculação: 6.0,
+  eliptico: 5.0,
+  esteira: 6.0,
+  futebol: 8.0,
+  basquete: 8.0,
+  volei: 4.0,
+  yoga: 3.0,
+  pilates: 3.5,
+};
+function guessMET(tipo?: string): number {
+  if (!tipo) return 5.0;
+  const key = tipo.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const found = Object.keys(METS).find((k) => key.includes(k));
+  return found ? METS[found] : 5.0;
+}
+
 // ===== Tooltip simples por hover =====
 function HoverTooltip({
   text,
@@ -216,7 +264,7 @@ function ExercisePanel({
                 fontSize: "1em",
                 borderRadius: "50%",
                 background: "hsl(var(--background))",
-                border: "1px solid hsl(var(--muted))",
+                border: "1px solid " + "hsl(var(--muted))",
                 width: 18,
                 height: 18,
                 display: "inline-flex",
@@ -256,7 +304,7 @@ function ExercisePanel({
               <span key={idx}>
                 {ex.duracao ? `${ex.duracao} ` : ""}
                 {ex.tipo ? ex.tipo : ""}
-                {ex.calorias ? ` (${ex.calorias} kcal)` : ""}
+                {ex.calorias ? ` (${Math.round(numberish(ex.calorias))} kcal)` : ""}
               </span>
             ))}
           </div>
@@ -403,8 +451,9 @@ export default function ProgressCharts({
   const [exercicioCalorias, setExercicioCalorias] = React.useState(0);
   const [exercicios, setExercicios] = React.useState<any[]>([]);
 
-  // Meta de água vinda do Firestore (metasusuario.waterGoalMl)
+  // Meta de água vinda do Firestore (metasusuario.waterGoalMl) e peso do usuário
   const [aguaMetaUser, setAguaMetaUser] = React.useState<number | null>(null);
+  const [pesoUsuario, setPesoUsuario] = React.useState<number>(70);
 
   React.useEffect(() => {
     if (!user?.email) return;
@@ -427,6 +476,7 @@ export default function ProgressCharts({
         setProteinaAtual(resumo.proteina ?? 0);
         setCarboidratoAtual(resumo.carboidrato ?? 0);
         setGorduraAtual(resumo.gordura ?? 0);
+        // água do resumo (padrão). Pode ser sobreposta pelo doc específico de água (abaixo).
         setAguaAtual(resumo.agua ?? 0);
       } else {
         setCaloriasAtual(0);
@@ -442,11 +492,22 @@ export default function ProgressCharts({
     const unsubExercicio = onSnapshot(exercicioDocRef, (exSnap) => {
       if (exSnap.exists()) {
         const dados = exSnap.data();
-        const lista = Array.isArray(dados.exercicios) ? dados.exercicios : [];
+        const listaRaw = Array.isArray(dados.exercicios) ? dados.exercicios : [];
         let totalCalEx = 0;
-        lista.forEach((ex) => {
-          totalCalEx += Number(ex.calorias) || 0;
+
+        const lista = listaRaw.map((ex: any) => {
+          const min = extractMinutes(String(ex.duracao || ""));
+          let kcal = numberish(ex.calorias);
+          if ((!kcal || isNaN(kcal)) && min > 0) {
+            // estima pela duração se calorias não veio da LLM
+            const met = guessMET(ex.tipo);
+            const kg = pesoUsuario || 70;
+            kcal = Math.round(met * kg * (min / 60));
+          }
+          totalCalEx += numberish(kcal);
+          return { ...ex, calorias: kcal };
         });
+
         setExercicios(lista);
         setExercicioCalorias(totalCalEx);
       } else {
@@ -455,7 +516,17 @@ export default function ProgressCharts({
       }
     });
 
-    // Meta de água do usuário (metasusuario -> doc mais recente)
+    // Doc dedicado de água do dia (sobrepõe o valor do resumo, se presente)
+    const aguaDocRef = doc(db, "chatfit", user.email, "agua", dia);
+    const unsubAgua = onSnapshot(aguaDocRef, (aguaSnap) => {
+      if (aguaSnap.exists()) {
+        const d = aguaSnap.data() as any;
+        const total = Number(d?.totalMl) || 0;
+        if (total > 0) setAguaAtual(total);
+      }
+    });
+
+    // Meta de água e (se existir) peso do usuário em metasusuario (doc mais recente)
     const metasRef = collection(db, "chatfit", user.email, "metasusuario");
     let unsubMeta: (() => void) | null = null;
 
@@ -466,9 +537,17 @@ export default function ProgressCharts({
           const d = snap.docs[0].data() as any;
           const ml =
             Number(d?.waterGoalMl) ||
-            Number(d?.aguaMeta) || // fallback de nome antigo
+            Number(d?.aguaMeta) || // fallback nome antigo
             0;
           if (ml > 0) setAguaMetaUser(ml);
+
+          const peso =
+            Number(d?.weightKg) ||
+            Number(d?.pesoKg) ||
+            Number(d?.peso) ||
+            Number(d?.weight_kg) ||
+            0;
+          if (peso > 0) setPesoUsuario(peso);
         }
       });
     } catch (e) {
@@ -482,6 +561,14 @@ export default function ProgressCharts({
               Number(d?.aguaMeta) ||
               0;
             if (ml > 0) setAguaMetaUser(ml);
+
+            const peso =
+              Number(d?.weightKg) ||
+              Number(d?.pesoKg) ||
+              Number(d?.peso) ||
+              Number(d?.weight_kg) ||
+              0;
+            if (peso > 0) setPesoUsuario(peso);
           }
         })
         .catch(() => {
@@ -492,9 +579,10 @@ export default function ProgressCharts({
     return () => {
       unsubResumo();
       unsubExercicio();
+      unsubAgua();
       if (unsubMeta) unsubMeta();
     };
-  }, [user, refreshKey]);
+  }, [user, refreshKey, pesoUsuario]); // pesoUsuario aqui reprocessa kcal estimada quando ele muda
 
   // Metas ajustadas por exercício
   const metaCaloriasAjustada = caloriasMeta + exercicioCalorias;

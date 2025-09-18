@@ -1,4 +1,20 @@
-import { AgentContext, AgentResult, LLMCaller } from "./types";
+import { AgentContext, AgentResult } from "./types";
+import { openAIChatCaller } from "@/ai/clients/openaiCaller";
+
+const SHOPPING_PROMPT = `
+Você gera **somente JSON** com uma lista de compras organizada em seções.
+Formato:
+{
+  "reply": "string curta",
+  "lista": [
+    { "item": "Arroz integral", "quantidade": "1 kg", "secao": "Grãos" },
+    { "item": "Peito de frango", "quantidade": "1.2 kg", "secao": "Carnes" }
+  ],
+  "dias": number,
+  "refeicoes_por_dia": number
+}
+Nunca use marcas.
+`;
 
 function parseJsonLoose(raw: string): any | null {
   if (!raw) return null;
@@ -6,82 +22,36 @@ function parseJsonLoose(raw: string): any | null {
   txt = txt.replace(/```(?:json)?\s*([\s\S]*?)```/gi, (_m, p1) => (p1 || "").trim());
   try {
     if (/^\s*[{[]/.test(txt)) return JSON.parse(txt);
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   return null;
 }
 
-/**
- * Agente de lista de compras.
- * - Constrói uma lista a partir do texto do usuário (ou futuramente do plano de dieta salvo).
- * - Se houver LLM, retorna um JSON com itens, quantidades e seção do mercado.
- */
-export async function runShoppingAgent(
-  text: string,
-  ctx: AgentContext,
-  llm?: LLMCaller
-): Promise<AgentResult> {
-  if (!llm) {
-    return {
-      domain: "shopping",
-      reply:
-        "Diga para quantos dias e quais refeições você quer cobrir que eu monto uma lista de compras.",
-      data: { hint: "Ex.: 'lista para 5 dias, almoço e jantar, low-carb'." },
-    };
+export async function runShoppingAgent(args: {
+  messages: Array<{ role: "user" | "assistant" | "system"; content: any }>;
+  ctx: AgentContext;
+  openAIApiKey: string;
+  model: string;
+}): Promise<AgentResult> {
+  const { messages, openAIApiKey, model } = args;
+  const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  const userText = typeof lastUser === "string" ? lastUser : "";
+
+  const { text } = await openAIChatCaller({
+    apiKey: openAIApiKey,
+    model,
+    system: SHOPPING_PROMPT,
+    messages: [{ role: "user", content: userText || "Lista de compras para 7 dias e 5 refeições/dia" }],
+    forceJson: true,
+  });
+
+  const obj = parseJsonLoose(text);
+  if (obj) {
+    return { domain: "shopping", reply: obj.reply || "Lista gerada.", data: obj };
   }
-
-  const system = `
-Você é um assistente de compras. Retorne **APENAS JSON** no formato:
-
-{
-  "reply": "frase curta",
-  "dias_planejados": 5,
-  "itens": [
-    { "item": "Peito de frango", "quantidade": 1.2, "unidade": "kg", "sessao": "açougue" },
-    { "item": "Arroz integral", "quantidade": 2, "unidade": "kg", "sessao": "grãos" },
-    { "item": "Ovos", "quantidade": 30, "unidade": "un", "sessao": "laticínios" }
-  ],
-  "observacoes": ["ajustes de marca/tamanho ok"]
-}
-
-Regras:
-- Português BR.
-- Agrupe mentalmente por sessão do mercado (açougue, hortifruti, laticínios, grãos, congelados, mercearia, bebidas).
-- Não invente marcas.
-- Não use markdown. Somente JSON.
-`.trim();
-
-  const user =
-    `Pedido de compras: "${(text || "").trim()}"` +
-    (ctx?.locale ? ` | locale=${ctx.locale}` : "");
-
-  try {
-    const { content } = await llm({
-      system,
-      messages: [{ role: "user", content: user }],
-      json: false,
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      max_tokens: 800,
-    });
-
-    const obj = parseJsonLoose(content);
-    if (obj && typeof obj === "object") {
-      return {
-        domain: "shopping",
-        reply: obj.reply || "Sua lista de compras está pronta.",
-        data: obj,
-      };
-    }
-  } catch {
-    /* fallback abaixo */
-  }
-
   return {
     domain: "shopping",
     reply:
-      "Me diga por quantos dias e para quais refeições quer comprar; eu retorno a lista organizada.",
+      "Diga por quantos dias e quantas refeições/dia quer comprar; gera(rei) a lista sem marcas.",
     data: null,
   };
 }

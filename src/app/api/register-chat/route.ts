@@ -5,6 +5,8 @@ import path from "path";
 import { getAuth } from "firebase-admin/auth";
 import { FOOD_SYSTEM_PROMPT } from "@/ai/prompts/foodLogger";
 import { parseNumberSafe } from "@/lib/utils";
+import { EXERCISE_SYSTEM_PROMPT } from "@/ai/prompts/exerciseLogger";
+import { UNIFIED_LOGGER_PROMPT } from "@/ai/prompts/unifiedLogger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic"; // opcional, evita cache
@@ -44,25 +46,49 @@ function getDiaAtual() {
 }
 
 const pesoMedioPorUnidade: Record<string, number> = {
-  melancia: 5000, melao: 1500, maçã: 130, laranja: 150, banana: 120,
-  "pão francês": 50, pao: 50, pao_frances: 50, "bife de carne": 120,
-  bife: 120, frango: 120, ovo: 50, pera: 160, manga: 300, abacaxi: 1400, tomate: 110, cenoura: 70, batata: 90,
+  // frutas
+  melancia: 5000, melao: 1500, "maçã": 130, maca: 130, laranja: 150, banana: 120, pera: 160, manga: 300, abacaxi: 1400,
+  tomate: 110, cenoura: 70, batata: 90,
+
+  // itens comuns
+  "pão francês": 50, pao: 50, pao_frances: 50, "pão de forma": 25, "fatia de pão": 25, "fatia de pão de forma": 25,
+  bife: 120, "bife de carne": 120, frango: 120, ovo: 50,
+
+  // sushi
   sushi: 30, temaki: 120, nigiri: 25, sashimi: 15,
+
+  // snacks/petit-fours
   biscoito: 6, bolacha: 7, cookie: 15, bombom: 20, chocolate: 25,
   pastel: 80, coxinha: 70, quibe: 90, empada: 60,
-  "pão de forma": 25, "fatia de pão": 25, "fatia de pão de forma": 25, "fatia": 25,
+
+  // medidas caseiras (peso médio do “conteúdo”)
   "colher de geleia": 15, "colher de sopa": 15, "colher": 15,
   "prato de salada": 100, "salada": 100, "salada verde": 100, "folhas": 30,
-  "prato": 300, "porção": 100, "tigela": 250, "bowl": 250
+  "prato": 300, "porção": 100, "tigela": 250, "bowl": 250,
+
+  // castanhas / nozes / sementes
+  amendoim: 1,             // ~1 g por grão
+  "amendoim japones": 2,   // grão com cobertura
+  "castanha de caju": 5,
+  "castanha-do-para": 5, "castanha do para": 5,
+  nozes: 5, noz: 5,
+  amendoa: 1.2, "amêndoa": 1.2,
+  pistache: 0.8,
+  avela: 1.2, "avelã": 1.2,
 };
 
 const unidadeParaGramas: Record<string, number> = {
-  ovo: 50, banana: 120, maçã: 130, pão: 50, frango: 120, arroz: 100, linguiça: 80,
-  couve: 50, farofa: 30, purê: 60, carne: 100, peixe: 100, unidade: 100, xicara: 120,
-  colher: 15, bife: 120, pato: 300, copo: 200, lata: 350, ml: 1,
-  sushi: 30, temaki: 120, nigiri: 25, sashimi: 15, biscoito: 6, bolacha: 7, cookie: 15,
-  pedaço: 70, porção: 100, prato: 300, tigela: 250, bowl: 250,
-  fatia: 25, "fatia de pão": 25, "fatia de pão de forma": 25
+  colher: 15,
+  colher_cha: 5,
+  xicara: 120,
+  copo: 200,
+  lata: 350,
+  bife: 120,
+  fatia: 25,
+  prato: 300,
+  tigela: 250,
+  bowl: 250,
+  ml: 1,
 };
 
 function stripAccents(s: string) {
@@ -82,6 +108,18 @@ function normalizarNome(nome: string) {
     .replace(/\bpães\b/g, "pao")
     .replace(/\bfatias\b/g, "fatia");
   return txt;
+}
+
+function ehAgua(texto: string) {
+  // normaliza: minúsculas + sem acentos
+  const n = stripAccents(String(texto || "").toLowerCase()).trim();
+  if (!n) return false;
+
+  // cobre "d'agua" / "dagua" -> "agua" para o \b funcionar
+  const n2 = n.replace(/\bd['’]?agua\b/g, "agua");
+
+  // palavra "agua" isolada em qualquer ponto da expressão
+  return /\bagua\b/.test(n2);
 }
 
 function normalizarUnidade(u: string) {
@@ -297,12 +335,11 @@ function evalNumber(val: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// NORMALIZA o formato vindo da LLM (quantidade número, porcaoUnitaria "unidade", pesoEstimado, etc.)
-// ---------- normalizarEntradaLLM (usando pesoMedioPorUnidadeNorm global) ----------
 function normalizarEntradaLLM(alimento: any) {
   const out = { ...alimento };
   const nomeNorm = normalizarNome(out.nome || "");
 
+  // normaliza 'quantidade'
   if (typeof out.quantidade === "number") {
     const hintRaw = String(out.unidade || out.porcaoUnitaria || "").toLowerCase();
     const hint = normalizarUnidade(hintRaw);
@@ -317,23 +354,27 @@ function normalizarEntradaLLM(alimento: any) {
     out.quantidade = "1 unidade";
   }
 
+  // se vier "porcaoUnitaria" textual da LLM, interpretamos:
   if (typeof out.porcaoUnitaria === "string") {
     const u = normalizarUnidade(out.porcaoUnitaria);
     if (u === "unidade") {
       if (typeof out.pesoEstimado === "number" && out.pesoEstimado > 0) {
         out.porcaoUnitaria = out.pesoEstimado;
       } else {
-        let pesoMedio = 100;
+        // tenta peso por unidade conhecido; fallback seguro = 30g
+        let pesoMedio = 0;
         for (const chave of Object.keys(pesoMedioPorUnidadeNorm)) {
           if (nomeNorm.includes(chave)) { pesoMedio = pesoMedioPorUnidadeNorm[chave]; break; }
         }
-        out.porcaoUnitaria = pesoMedio;
+        out.porcaoUnitaria = pesoMedio || 30;
       }
     } else {
+      // se não é "unidade", não forçamos nada aqui
       delete out.porcaoUnitaria;
     }
   }
 
+  // se a LLM mandou pesoEstimado e a quantidade foi em "unidade/fatia/colher", guarda como porção unitária
   if (
     !out.porcaoUnitaria &&
     typeof out.pesoEstimado === "number" &&
@@ -345,7 +386,6 @@ function normalizarEntradaLLM(alimento: any) {
   return out;
 }
 
-// ---------- toGramas (usando pesoMedioPorUnidadeNorm e unidadeParaGramasNorm globais) ----------
 function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidade: string } {
   if (alimento._ml_total && alimento._ml_total > 0) {
     return { quantidade: `${alimento._ml_total} ml`, valorQtd: alimento._ml_total, unidade: "ml" };
@@ -361,6 +401,7 @@ function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidad
   const temPrato = nomeNorm.includes("prato") || unidadeCanon === "prato";
   const temColher = nomeNorm.includes("colher") || unidadeCanon === "colher";
 
+  // porção unitária explícita (ex.: 10 unidades * 1.2 g por unidade)
   if (alimento.porcaoUnitaria && Number(alimento.porcaoUnitaria) > 0) {
     if (unidadeCanon === "unidade" || unidadeCanon === "fatia" || unidadeCanon === "") {
       const g = valor * Number(alimento.porcaoUnitaria);
@@ -368,8 +409,9 @@ function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidad
     }
   }
 
+  // usa portion_grams do JSON apenas quando a unidade NÃO for "unidade"/"fatia"
   if (jsonInfo?.portion_grams > 0) {
-    if (unidadeCanon === "unidade" || unidadeCanon === "fatia" || unidadeCanon === "") {
+    if (unidadeCanon === "") {
       const g = valor * jsonInfo.portion_grams;
       return { quantidade: `${Math.round(g * 10) / 10} g`, valorQtd: g, unidade: "g" };
     }
@@ -388,15 +430,18 @@ function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidad
     return { quantidade: `${Math.round(g * 10) / 10} g`, valorQtd: g, unidade: "g" };
   }
 
+  // unidade/unidade vazia → tenta peso específico por item; fallback 30 g
   if (unidadeCanon === "unidade" || unidadeCanon === "") {
-    let pesoMedio = 100;
+    let pesoMedio = 0;
     for (const chave of Object.keys(pesoMedioPorUnidadeNorm)) {
       if (nomeNorm.includes(chave)) { pesoMedio = pesoMedioPorUnidadeNorm[chave]; break; }
     }
+    if (!pesoMedio) pesoMedio = 30;
     const g = valor * pesoMedio;
     return { quantidade: `${Math.round(g * 10) / 10} g`, valorQtd: g, unidade: "g" };
   }
 
+  // copo/lata/xícara → converte para ml
   if (unidadeCanon === "copo" || unidadeCanon === "lata" || unidadeCanon === "xicara") {
     const bebidaMlMatch = String(alimento.quantidade || alimento.nome || "").match(
       /(\d+)[^\d]+(copo|lata|xicara)[^\d]*(\d+)\s*ml/i
@@ -415,14 +460,16 @@ function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidad
     }
   }
 
+  // ml / litro
   if (unidadeCanon === "ml" || unidadeCanon === "l") {
     const ml = unidadeCanon === "l" ? valor * 1000 : valor;
     return { quantidade: `${Math.round(ml * 10) / 10} ml`, valorQtd: ml, unidade: "ml" };
   }
 
+  // outras medidas caseiras conhecidas → converte para g
   if (unidadeCanon !== "g") {
-    if (unidadeCanon in unidadeParaGramasNorm) {
-      const g = valor * (unidadeParaGramasNorm[unidadeCanon] || unidadeParaGramasNorm["unidade"]);
+    if (unidadeCanon !== "unidade" && (unidadeCanon in unidadeParaGramasNorm)) {
+      const g = valor * unidadeParaGramasNorm[unidadeCanon];
       return { quantidade: `${Math.round(g * 10) / 10} g`, valorQtd: g, unidade: "g" };
     } else if (unidadeCanon === "kg") {
       const g = valor * 1000;
@@ -433,21 +480,20 @@ function toGramas(alimento: any): { quantidade: string; valorQtd: number; unidad
     }
   }
 
+  // já está em g
   const g = valor;
   return { quantidade: `${Math.round(g * 10) / 10} g`, valorQtd: g, unidade: "g" };
 }
 
-// =================== adicionarAlimentosFirestore (NÃO confiar no dia da LLM) ===================
 async function adicionarAlimentosFirestore(
   userEmail: string,
   alimentos: any[],
-  diaPadrao: string // texto original do usuário (para extrair ontem/hoje/amanhã ou datas)
+  diaPadrao: string
 ) {
   if (!Array.isArray(alimentos)) return;
 
   const TZ_OFFSET = "-03:00";
 
-  // Hoje (BRT)
   function todayYMD_BRT(): string {
     const d = getBrasiliaDate();
     const y = d.getUTCFullYear();
@@ -455,19 +501,15 @@ async function adicionarAlimentosFirestore(
     const dd = pad2(d.getUTCDate());
     return `${y}-${m}-${dd}`;
   }
-
   function ymdAddDays(ymd: string, days: number): string {
     const [y, m, d] = ymd.split("-").map(Number);
     const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1));
     dt.setUTCDate(dt.getUTCDate() + days);
     return dt.toISOString().slice(0, 10);
   }
-
   function toBrasilISO(ymd: string, h = 12, m = 0, s = 0): string {
     return `${ymd}T${pad2(h)}:${pad2(m)}:${pad2(s)}${TZ_OFFSET}`;
   }
-
-  // Extrai DIA apenas do TEXTO do usuário
   function parseDiaFromText(input?: string): string | null {
     if (!input) return null;
     const raw = stripAccents(String(input).trim().toLowerCase());
@@ -488,8 +530,6 @@ async function adicionarAlimentosFirestore(
     }
     return null;
   }
-
-  // Extrai HH:MM (de texto)
   function parseHoraMin(str?: string): { h: number; m: number } | null {
     if (!str) return null;
     const m = String(str).match(/(^|\D)(\d{1,2}):(\d{2})(\D|$)/);
@@ -498,8 +538,6 @@ async function adicionarAlimentosFirestore(
     if (h >= 0 && h < 24 && mi >= 0 && mi < 60) return { h, m: mi };
     return null;
   }
-
-  // Infere refeição a partir do texto do usuário
   function inferMealFromText(txt?: string): string | null {
     if (!txt) return null;
     const r = stripAccents(txt.toLowerCase());
@@ -511,8 +549,6 @@ async function adicionarAlimentosFirestore(
     if (r.includes("ceia") || r.includes("noite")) return "ceia";
     return null;
   }
-
-  // horas padrão por refeição
   function defaultHourByMeal(ref: string): { h: number; m: number } {
     const r = stripAccents((ref || "").toLowerCase());
     if (r.includes("cafe")) return { h: 4,  m: 0 };
@@ -523,13 +559,11 @@ async function adicionarAlimentosFirestore(
     if (r.includes("ceia") || r.includes("noite") || r.includes("lanche da noite")) return { h: 21, m: 0 };
     return { h: 12, m: 0 };
   }
-
   function periodoPorHorario(horarioISO: string) {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(horarioISO)) return "Indefinido";
     const h = Number(horarioISO.slice(11, 13));
     const mi = Number(horarioISO.slice(14, 16));
     const t = h * 60 + mi;
-
     if (t >= 240 && t < 600)   return "café da manhã";
     if (t >= 600 && t < 720)   return "lanche da manhã";
     if (t >= 720 && t < 900)   return "almoço";
@@ -538,33 +572,26 @@ async function adicionarAlimentosFirestore(
     if (t >= 1260 || t < 240)  return "ceia";
     return "Indefinido";
   }
-
   function nowHM_BRT(): { h: number; m: number } {
     const d = getBrasiliaDate();
     return { h: d.getUTCHours(), m: d.getUTCMinutes() };
   }
 
   const diasUsados = new Set<string>();
-  const diaFromUser = parseDiaFromText(diaPadrao); // <- Só este pode mudar o dia
+  const diaFromUser = parseDiaFromText(diaPadrao);
 
   for (const _alimento of alimentos) {
     if (!_alimento || !_alimento.nome) continue;
 
-    // Normaliza entrada inconsistente da LLM
     const alimento = normalizarEntradaLLM ? normalizarEntradaLLM(_alimento) : _alimento;
 
     try {
-      // ---------- DIA ----------
-      // NUNCA confiar no dia da LLM; usar o dia do usuário (se houver) ou hoje.
+      // ---------- DIA / HORA ----------
       const diaRegistro = diaFromUser || todayYMD_BRT();
-
-      // ---------- HORA ----------
-      const hmFromText = parseHoraMin(diaPadrao); // HH:MM no texto do usuário
-      const isPureTimeField =
-        typeof alimento?.horario === "string" && /^\s*\d{1,2}:\d{2}\s*$/.test(alimento.horario);
+      const hmFromText = parseHoraMin(diaPadrao);
+      const isPureTimeField = typeof alimento?.horario === "string" && /^\s*\d{1,2}:\d{2}\s*$/.test(alimento.horario);
       const hmFromField = isPureTimeField ? parseHoraMin(alimento.horario) : null;
 
-      // Se a LLM mandou um ISO completo, extraímos **apenas a HORA** (ignoramos a data)
       let hFromISO: number | null = null;
       let mFromISO: number | null = null;
       if (typeof alimento?.horario === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(alimento.horario)) {
@@ -575,7 +602,6 @@ async function adicionarAlimentosFirestore(
         }
       }
 
-      // Refeição informada no item (LLM) ou inferida do texto do usuário
       const refeicaoFromItem = typeof alimento?.refeicao === "string" ? alimento.refeicao : "";
       const refeicaoFromText = inferMealFromText(diaPadrao) || "";
       const refeicaoRef = refeicaoFromItem || refeicaoFromText;
@@ -587,20 +613,12 @@ async function adicionarAlimentosFirestore(
 
       const horarioFinal = toBrasilISO(diaRegistro, hFinal, mFinal);
 
-      // ---------- REFEIÇÃO (derivada da hora final) ----------
-      const refeicaoFinal = periodoPorHorario(horarioFinal);
-
-      // ---------- PORÇÃO ----------
-      const nomeNorm = normalizarNome(alimento.nome);
-      const jsonInfo = buscarPorcaoJson(nomeNorm);
-      if (jsonInfo?.portion_grams && !alimento.porcaoUnitaria) {
-        alimento.porcaoUnitaria = jsonInfo.portion_grams;
-      }
-
-      // ---------- MACROS ----------
+      // ---------- QUANTIDADE (g/ml) ----------
       const gramasObj = toGramas(alimento);
       const unidadeCanon = gramasObj.unidade;
 
+      // ---------- MACROS ----------
+      const nomeNorm = normalizarNome(alimento.nome);
       let macros = {
         calorias: evalNumber(alimento.calorias),
         proteina: evalNumber(alimento.proteina),
@@ -627,7 +645,7 @@ async function adicionarAlimentosFirestore(
             gordura: Math.round(br.gordura * f * 10) / 10,
             fonteMacros: br.fonteMacros,
           };
-          nomeUtilizado = br.nomeUsado || alimento.nome;
+          nomeUtilizado = alimento.nome;
         } else {
           const of = await buscarOpenFood(alimento.nome);
           if (of) {
@@ -639,19 +657,32 @@ async function adicionarAlimentosFirestore(
               gordura: Math.round(of.gordura * f * 10) / 10,
               fonteMacros: of.fonteMacros,
             };
-            nomeUtilizado = of.nomeUsado || alimento.nome;
+            nomeUtilizado = alimento.nome;
           }
         }
       }
 
+      // ---------- ÁGUA (ml) ----------
+      // ATENÇÃO: só somamos água se o item for "água" e a unidade final for ML (copo/xícara/lata -> ml já tratado em toGramas)
+      const isAgua = ehAgua(alimento.nome);
+      const aguaMlToAdd = (isAgua && unidadeCanon === "ml") ? Math.round(gramasObj.valorQtd) : 0;
+
       // ---------- FIRESTORE ----------
       const docId = alimentoDocId(normalizarNome(nomeUtilizado || alimento.nome), unidadeCanon);
       const itemRef = doc(db, "chatfit", userEmail, "refeicoes", diaRegistro, "historicoAlimentos", docId);
+      const aguaRef = doc(db, "chatfit", userEmail, "agua", diaRegistro);
 
       await runTransaction(db, async (tx) => {
+        // 🔹 LEITURAS PRIMEIRO (regra de transação do Firestore)
         const snap = await tx.get(itemRef);
 
-        // 🔧 Admin SDK => usar 'exists' (propriedade), não 'exists()'
+        let prevAguaTotal = 0;
+        if (aguaMlToAdd > 0) {
+          const aguaSnap = await tx.get(aguaRef);
+          prevAguaTotal = aguaSnap.exists ? (Number((aguaSnap.data() as any).totalMl) || 0) : 0;
+        }
+
+        // 🔹 ESCRITAS
         if (!snap.exists) {
           tx.set(itemRef, {
             nome: alimento.nome,
@@ -666,8 +697,10 @@ async function adicionarAlimentosFirestore(
             criadoPor: userEmail,
             fonteMacros: macros.fonteMacros || "",
             nomeUtilizado,
-            refeicao: refeicaoFinal,
+            refeicao: periodoPorHorario(horarioFinal),
             dia: diaRegistro,
+            // registra água por item (usado no resumo)
+            agua: aguaMlToAdd || 0,
           });
         } else {
           const data = snap.data() as any;
@@ -684,14 +717,26 @@ async function adicionarAlimentosFirestore(
             horario: horarioFinal,
             fonteMacros: macros.fonteMacros || "",
             nomeUtilizado,
-            refeicao: refeicaoFinal,
+            refeicao: periodoPorHorario(horarioFinal),
             dia: diaRegistro,
+            // acumula água neste item
+            agua: (evalNumber((data as any).agua) || 0) + (aguaMlToAdd || 0),
           });
+        }
+
+        if (aguaMlToAdd > 0) {
+          tx.set(
+            aguaRef,
+            { totalMl: prevAguaTotal + aguaMlToAdd, updatedAt: getHorarioBrasilISO() },
+            { merge: true }
+          );
         }
       });
 
-      // log leve pra auditoria
-      console.log(`[REGISTRO] OK: ${nomeUtilizado} (${gramasObj.quantidade}) em ${diaRegistro} @ ${horarioFinal}`);
+      console.log(
+        `[REGISTRO] OK: ${nomeUtilizado} (${gramasObj.quantidade}) em ${diaRegistro} @ ${horarioFinal}` +
+        (aguaMlToAdd ? ` | água +${aguaMlToAdd} ml` : "")
+      );
 
       diasUsados.add(diaRegistro);
     } catch (err) {
@@ -699,7 +744,6 @@ async function adicionarAlimentosFirestore(
     }
   }
 
-  // Atualiza resumo dos dias usados
   for (const dia of diasUsados) {
     await salvarResumoAcumulado(userEmail, dia);
   }
@@ -708,83 +752,94 @@ async function adicionarAlimentosFirestore(
 async function excluirAlimentosFirestore(userEmail: string, alimentos: any[], dia: string) {
   if (!Array.isArray(alimentos)) return;
 
-  // Helper para tentar múltiplas unidades quando o item não tem unidade explícita
   async function tryDeleteOrUpdateByUnit(
     nomeNorm: string,
     unidadeTentativa: string,
     originalAlimento: any
   ) {
-    const docId = alimentoDocId(nomeNorm, unidadeTentativa);
-    const itemRef = doc(db, "chatfit", userEmail, "refeicoes", dia, "historicoAlimentos", docId);
+    const itemRef = doc(db, "chatfit", userEmail, "refeicoes", dia, "historicoAlimentos", alimentoDocId(nomeNorm, unidadeTentativa));
+    const aguaRef = doc(db, "chatfit", userEmail, "agua", dia);
 
     await runTransaction(db, async (tx) => {
-      const snap = await tx.get(itemRef);
-      if (!snap.exists) return; // não há esse item nessa unidade, deixa outra tentativa cuidar
+      // 🔹 TODOS os reads primeiro
+      const [snap, aguaSnap0] = await Promise.all([tx.get(itemRef), tx.get(aguaRef)]);
+      if (!snap.exists) return;
 
       const data = snap.data() as any;
       const qtdBanco = parseQuantidade(String(data.quantidade || "")).valor || 0;
-      if (qtdBanco <= 0) {
-        tx.delete(itemRef);
-        return;
-      }
+      const totalAguaItem = Number(data.agua) || 0;
 
-      // Determina quanto remover (convertendo "1 unidade", "1 lata", "2 fatias" -> g/ml)
+      // calcula quanto remover
+      let removeTudo = false;
       let qtdExcluir = 0;
+
       if (!originalAlimento.quantidade || originalAlimento.quantidade === "") {
-        // Sem quantidade informada => remove tudo
-        tx.delete(itemRef);
-        return;
+        removeTudo = true;
       } else {
-        // Converte para g/ml usando a mesma lógica do toGramas
         const conv = toGramas({
           nome: originalAlimento.nome,
           quantidade: originalAlimento.quantidade,
           porcaoUnitaria: originalAlimento.porcaoUnitaria,
         });
-
-        // Se a unidade do doc for ml e a conversão veio em g (ou vice-versa), assume 1:1 (água/bebida)
         if (data.unidade === "ml" && conv.unidade === "g") {
-          qtdExcluir = conv.valorQtd; // aproxima 1g = 1ml
+          qtdExcluir = conv.valorQtd;
         } else if (data.unidade === "g" && conv.unidade === "ml") {
-          qtdExcluir = conv.valorQtd; // aproxima 1ml = 1g
+          qtdExcluir = conv.valorQtd;
         } else {
           qtdExcluir = conv.valorQtd || 0;
         }
+        if (qtdExcluir >= qtdBanco) removeTudo = true;
       }
 
-      // Apaga total ou parcial
-      if (qtdExcluir >= qtdBanco) {
-        tx.delete(itemRef);
-      } else {
-        const novaQtd = Math.max(qtdBanco - qtdExcluir, 0);
-        const novaQtdStr = `${Math.round(novaQtd * 10) / 10} ${data.unidade}`;
+      const prevAguaDia = aguaSnap0.exists ? (Number((aguaSnap0.data() as any).totalMl) || 0) : 0;
 
-        // Atualiza macros de forma proporcional
-        const fator = qtdBanco > 0 ? novaQtd / qtdBanco : 0;
-        tx.update(itemRef, {
-          quantidade: novaQtdStr,
-          calorias: (evalNumber(data.calorias) || 0) * fator,
-          proteina: (evalNumber(data.proteina) || 0) * fator,
-          carboidrato: (evalNumber(data.carboidrato) || 0) * fator,
-          gordura: (evalNumber(data.gordura) || 0) * fator,
-        });
+      if (removeTudo || qtdBanco <= 0) {
+        // 🔸 writes depois dos reads
+        if (totalAguaItem > 0) {
+          tx.set(aguaRef, { totalMl: Math.max(prevAguaDia - totalAguaItem, 0), updatedAt: getHorarioBrasilISO() }, { merge: true });
+        }
+        tx.delete(itemRef);
+        return;
+      }
+
+      // parcial
+      const novaQtd = Math.max(qtdBanco - qtdExcluir, 0);
+      const fator = qtdBanco > 0 ? novaQtd / qtdBanco : 0;
+      const novaQtdStr = `${Math.round(novaQtd * 10) / 10} ${data.unidade}`;
+
+      const c = evalNumber(data.calorias) || 0;
+      const p = evalNumber(data.proteina) || 0;
+      const cb = evalNumber(data.carboidrato) || 0;
+      const g = evalNumber(data.gordura) || 0;
+      const a = evalNumber(data.agua) || 0;
+
+      const novoAgua = Math.round((a * fator) * 10) / 10;
+      const deltaAgua = a - novoAgua; // quanto abater do doc diário
+
+      // 🔸 writes depois dos reads
+      tx.update(itemRef, {
+        quantidade: novaQtdStr,
+        calorias: c * fator,
+        proteina: p * fator,
+        carboidrato: cb * fator,
+        gordura: g * fator,
+        agua: novoAgua,
+      });
+
+      if (deltaAgua > 0) {
+        tx.set(aguaRef, { totalMl: Math.max(prevAguaDia - deltaAgua, 0), updatedAt: getHorarioBrasilISO() }, { merge: true });
       }
     });
   }
 
   for (const alimento of alimentos) {
     if (!alimento || !alimento.nome) continue;
-
     try {
       const nomeNorm = normalizarNome(alimento.nome);
-      // Se o usuário passar uma unidade explícita, tentamos somente ela;
-      // se não passar, tentamos as duas mais comuns: "g" e "ml".
       const unidadeCanon = alimento.unidade ? normalizarUnidade(alimento.unidade) : "";
-
       if (unidadeCanon) {
         await tryDeleteOrUpdateByUnit(nomeNorm, unidadeCanon, alimento);
       } else {
-        // primeiro tenta g, depois ml
         await tryDeleteOrUpdateByUnit(nomeNorm, "g", alimento);
         await tryDeleteOrUpdateByUnit(nomeNorm, "ml", alimento);
       }
@@ -887,58 +942,233 @@ async function adicionarExerciciosFirestore(userEmail: string, exercicios: any[]
 
 async function excluirExerciciosFirestore(userEmail: string, exercicios: any[], dia: string) {
   if (!Array.isArray(exercicios) || !exercicios.length) return;
+
+  // Helpers locais
+  const tipoKey = (s: string) => stripAccents((s || "").toLowerCase().trim());
+  const round1 = (n: number) => Math.round(n * 10) / 10;
+
+  function subtrairPorMinutos(lista: any[], tipoNorm: string, minutosAlvo: number, horario?: string) {
+    let restante = Math.max(0, minutosAlvo || 0);
+    if (!restante) return { lista, restante };
+
+    for (let i = 0; i < lista.length && restante > 0; i++) {
+      const e = lista[i];
+      if (!e || tipoKey(e.tipo) !== tipoNorm) continue;
+      if (horario && e.horario && e.horario !== horario) continue;
+
+      const dur = extrairMinutos(String(e.duracao || ""));
+      if (dur <= 0) continue;
+
+      const delta = Math.min(dur, restante);
+      const novoDur = dur - delta;
+
+      // ajusta calorias proporcionalmente, se houver
+      if (typeof e.calorias === "number" && dur > 0) {
+        e.calorias = round1((e.calorias || 0) * (novoDur / dur));
+      }
+
+      if (novoDur <= 0) {
+        // remove a entrada
+        lista[i] = null;
+      } else {
+        e.duracao = formatarDuracaoMinutos(novoDur);
+      }
+
+      restante -= delta;
+    }
+
+    const filtrada = (lista.filter(Boolean) as any[]);
+    return { lista: filtrada, restante };
+  }
+
+  function subtrairPorCalorias(lista: any[], tipoNorm: string, kcalAlvo: number, horario?: string) {
+    let restante = Math.max(0, kcalAlvo || 0);
+    if (!restante) return { lista, restante };
+
+    for (let i = 0; i < lista.length && restante > 0; i++) {
+      const e = lista[i];
+      if (!e || tipoKey(e.tipo) !== tipoNorm) continue;
+      if (horario && e.horario && e.horario !== horario) continue;
+
+      const kcal = Number(e.calorias || 0);
+      if (kcal <= 0) continue;
+
+      const delta = Math.min(kcal, restante);
+      const novaKcal = kcal - delta;
+
+      // se tiver duração, ajusta proporcionalmente
+      const dur = extrairMinutos(String(e.duracao || ""));
+      if (dur > 0) {
+        const novoDur = (novaKcal <= 0) ? 0 : Math.max(0, Math.round((dur * novaKcal) / kcal));
+        e.duracao = formatarDuracaoMinutos(novoDur);
+      }
+
+      if (novaKcal <= 0) {
+        lista[i] = null;
+      } else {
+        e.calorias = round1(novaKcal);
+      }
+
+      restante -= delta;
+    }
+
+    const filtrada = (lista.filter(Boolean) as any[]);
+    return { lista: filtrada, restante };
+  }
+
   try {
     const docRef = doc(db, "chatfit", userEmail, "exerciciosDoDia", dia);
+
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(docRef);
       if (!snap.exists) return;
+
       let lista: any[] = Array.isArray(snap.data().exercicios) ? [...snap.data().exercicios] : [];
+
       for (const ex of exercicios) {
-        lista = lista.filter(e =>
-          !(
-            e.tipo?.toLowerCase() === (ex.tipo ?? "").toLowerCase() &&
-            (!ex.duracao || e.duracao === ex.duracao) &&
-            (!ex.horario || e.horario === ex.horario)
-          )
-        );
+        const tipoNorm = tipoKey(ex?.tipo || "");
+        if (!tipoNorm) continue;
+
+        const hasDur = typeof ex?.duracao === "string" && extrairMinutos(ex.duracao) > 0;
+        const hasKcal = typeof ex?.calorias === "number" && ex.calorias > 0;
+        const horario = typeof ex?.horario === "string" ? ex.horario : undefined;
+
+        if (hasDur) {
+          const minutosAlvo = extrairMinutos(ex.duracao);
+          const r = subtrairPorMinutos(lista, tipoNorm, minutosAlvo, horario);
+          lista = r.lista;
+          // se sobrar "restante", ignoramos (não há mais do que subtrair)
+          continue;
+        }
+
+        if (hasKcal) {
+          const r = subtrairPorCalorias(lista, tipoNorm, ex.calorias, horario);
+          lista = r.lista;
+          continue;
+        }
+
+        // Sem duração nem kcal → exclusão total do tipo (ou do horário específico, se passado)
+        lista = lista.filter((e) => {
+          if (!e || tipoKey(e.tipo) !== tipoNorm) return true;
+          if (horario && e.horario && e.horario !== horario) return true;
+          return false; // remove
+        });
       }
+
       tx.set(docRef, { exercicios: lista }, { merge: true });
     });
   } catch (err) {
-    console.error("[EXERCICIO] Falha ao excluir exercícios:", err);
+    console.error("[EXERCICIO] Falha ao excluir exercícios (robusto):", err);
   }
 }
 
 async function excluirParcialExerciciosFirestore(userEmail: string, exercicios: any[], dia: string) {
   if (!Array.isArray(exercicios) || !exercicios.length) return;
+
+  const tipoKey = (s: string) => stripAccents((s || "").toLowerCase().trim());
+  const round1 = (n: number) => Math.round(n * 10) / 10;
+
+  function subtrairPorMinutos(lista: any[], tipoNorm: string, minutosAlvo: number, horario?: string) {
+    let restante = Math.max(0, minutosAlvo || 0);
+    if (!restante) return { lista, restante };
+
+    for (let i = 0; i < lista.length && restante > 0; i++) {
+      const e = lista[i];
+      if (!e || tipoKey(e.tipo) !== tipoNorm) continue;
+      if (horario && e.horario && e.horario !== horario) continue;
+
+      const dur = extrairMinutos(String(e.duracao || ""));
+      if (dur <= 0) continue;
+
+      const delta = Math.min(dur, restante);
+      const novoDur = dur - delta;
+
+      if (typeof e.calorias === "number" && dur > 0) {
+        e.calorias = round1((e.calorias || 0) * (novoDur / dur));
+      }
+
+      if (novoDur <= 0) {
+        lista[i] = null;
+      } else {
+        e.duracao = formatarDuracaoMinutos(novoDur);
+      }
+
+      restante -= delta;
+    }
+
+    return { lista: (lista.filter(Boolean) as any[]), restante };
+  }
+
+  function subtrairPorCalorias(lista: any[], tipoNorm: string, kcalAlvo: number, horario?: string) {
+    let restante = Math.max(0, kcalAlvo || 0);
+    if (!restante) return { lista, restante };
+
+    for (let i = 0; i < lista.length && restante > 0; i++) {
+      const e = lista[i];
+      if (!e || tipoKey(e.tipo) !== tipoNorm) continue;
+      if (horario && e.horario && e.horario !== horario) continue;
+
+      const kcal = Number(e.calorias || 0);
+      if (kcal <= 0) continue;
+
+      const delta = Math.min(kcal, restante);
+      const novaKcal = kcal - delta;
+
+      const dur = extrairMinutos(String(e.duracao || ""));
+      if (dur > 0) {
+        const novoDur = (novaKcal <= 0) ? 0 : Math.max(0, Math.round((dur * novaKcal) / kcal));
+        e.duracao = formatarDuracaoMinutos(novoDur);
+      }
+
+      if (novaKcal <= 0) {
+        lista[i] = null;
+      } else {
+        e.calorias = round1(novaKcal);
+      }
+
+      restante -= delta;
+    }
+
+    return { lista: (lista.filter(Boolean) as any[]), restante };
+  }
+
   try {
     const docRef = doc(db, "chatfit", userEmail, "exerciciosDoDia", dia);
+
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(docRef);
       if (!snap.exists) return;
+
       let lista: any[] = Array.isArray(snap.data().exercicios) ? [...snap.data().exercicios] : [];
+
       for (const ex of exercicios) {
-        lista = lista.map(e => {
-          if (e.tipo?.toLowerCase() === (ex.tipo ?? "").toLowerCase()) {
-            const novaCaloria = (e.calorias ?? 0) - (ex.calorias ?? 0);
-            let novaDuracao = e.duracao;
-            if (typeof e.duracao === "string" && typeof ex.duracao === "string") {
-              const durBanco = extrairMinutos(e.duracao);
-              const durExcluir = extrairMinutos(ex.duracao);
-              const durRestante = Math.max(durBanco - durExcluir, 0);
-              novaDuracao = formatarDuracaoMinutos(durRestante);
-            }
-            return novaCaloria > 0
-              ? { ...e, calorias: novaCaloria, duracao: novaDuracao }
-              : null;
-          }
-          return e;
-        }).filter(Boolean) as any[];
+        const tipoNorm = tipoKey(ex?.tipo || "");
+        if (!tipoNorm) continue;
+
+        const hasDur = typeof ex?.duracao === "string" && extrairMinutos(ex.duracao) > 0;
+        const hasKcal = typeof ex?.calorias === "number" && ex.calorias > 0;
+        const horario = typeof ex?.horario === "string" ? ex.horario : undefined;
+
+        if (hasDur) {
+          const minutosAlvo = extrairMinutos(ex.duracao);
+          const r = subtrairPorMinutos(lista, tipoNorm, minutosAlvo, horario);
+          lista = r.lista;
+          continue;
+        }
+
+        if (hasKcal) {
+          const r = subtrairPorCalorias(lista, tipoNorm, ex.calorias, horario);
+          lista = r.lista;
+          continue;
+        }
+
+        // Se cair aqui sem duração nem kcal, não faz nada (parcial exige magnitude)
       }
+
       tx.set(docRef, { exercicios: lista }, { merge: true });
     });
   } catch (err) {
-    console.error("[EXERCICIO] Falha ao excluir parcialmente exercícios:", err);
+    console.error("[EXERCICIO] Falha ao excluir parcialmente exercícios (robusto):", err);
   }
 }
 
@@ -968,6 +1198,28 @@ async function substituirExerciciosFirestore(userEmail: string, substituicoes: a
     await excluirExerciciosFirestore(userEmail, [sub.de], dia);
     await adicionarExerciciosFirestore(userEmail, [sub.para], dia);
   }
+}
+
+function guessDomainSimple(text: string, hasImage?: boolean): "food" | "exercise" {
+  if (hasImage) return "food"; // imagem → prato/alimento
+
+  const t = (text || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  // palavras de comida
+  if (/\b(alimento|comi|comida|lanche|refeic(a|ç)ao|calorias|macro|almoco|jantar|cafe|ceia)\b/.test(t))
+    return "food";
+
+  // exercícios (verbos + esportes + pistas de tempo)
+  const hasExerciseVerb =
+    /\b(exercicio|exercicios|treino|treinar|musculacao|corri|correr|corrida|pedalei|pedalar|caminhei|caminhar|caminhada|nadei|nadar|natacao|remada|eliptico|esteira|agachamento|supino|abd(o|ô)minal|prancha|yoga|pilates|hiit|hit)\b/.test(t);
+  const hasSport =
+    /\b(tenis|t[eê]nis|futebol|basquete|volei|bicicleta|bike|spinning|corrida)\b/.test(t);
+  const hasTimeUnits = /\b\d+\s?(min|mins|minutos|km|kcal|h|hr|hora|horas)\b/.test(t);
+
+  if (hasExerciseVerb || hasSport || (hasTimeUnits && /\b(corr|bike|bicic|caminh|nada|exerc|trein)\w*/.test(t)))
+    return "exercise";
+
+  return "food";
 }
 
 // --------- PARSER GPT -----------
@@ -1059,13 +1311,10 @@ function buildOpenAIMessages({
   return [{ role: "system", content: systemPrompt }, ...messages];
 }
 
-function buildFoodMessages(
-  messages: any[],
-  imageBase64?: string
-) {
-  // Usa o prompt oficial do arquivo de prompts
+function buildUnifiedMessages(messages: any[], imageBase64?: string) {
+  // sempre usa o prompt unificado; se houver imagem, ela entra como multimodal
   return buildOpenAIMessages({
-    systemPrompt: FOOD_SYSTEM_PROMPT,
+    systemPrompt: UNIFIED_LOGGER_PROMPT,
     messages: getLastRelevantMessages(messages, 3),
     imageBase64,
   });
@@ -1193,7 +1442,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 5) Monta mensagens p/ OpenAI **usando o prompt oficial**
-    const openAIMessages = buildFoodMessages(messages, imageBase64);
+    const openAIMessages = buildUnifiedMessages(messages, imageBase64);
 
     // 6) Chama OpenAI (json strict)
     let data: any = null;

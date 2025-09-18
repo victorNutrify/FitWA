@@ -1,80 +1,132 @@
+// src/ai/agents/exercise.ts
 import { AgentContext, AgentResult } from "./types";
 import { EXERCISE_SYSTEM_PROMPT } from "@/ai/prompts/exerciseLogger";
+import { openAIChatCaller } from "@/ai/clients/openaiCaller";
+import { db, doc, setDoc, collection } from "@/lib/firestore.admin.compat";
 
-/** Remove cercas ```...``` e tenta parsear como JSON; fallback mantém reply texto */
-function parseExercisesFromLLM(rawText: string): any {
-  let text = rawText || "";
+function parseJsonLoose(rawText: string): any {
+  let text = String(rawText || "");
   text = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, (_m, p1) => String(p1 || "").trim());
   try {
     if (/^\s*{/.test(text)) return JSON.parse(text);
     if (/^\s*\[/.test(text)) return { exercicios: JSON.parse(text), reply: "" };
   } catch {
-    return { reply: rawText };
+    /* ignore */
   }
-  return { reply: text };
+  return { reply: rawText ?? "" };
 }
 
-/** Monta mensagens para a LLM com prompt oficial de exercícios */
-function buildExerciseMessages(
-  history: Array<{ role: "user" | "assistant"; content: string }>
-) {
-  const systemMsg = { role: "system" as const, content: EXERCISE_SYSTEM_PROMPT };
+function todayKey(): string {
+  // YYYY-MM-DD (UTC)
+  return new Date().toISOString().slice(0, 10);
+}
 
-  const filtered = (Array.isArray(history) ? history : []).filter(
-    (m) => m && (m.role === "user" || m.role === "assistant")
+function newId() {
+  return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function persistExerciseOps(args: {
+  userEmail?: string;
+  reply: string;
+  model: string;
+  data: {
+    exercicios?: any[];
+    exercicios_a_excluir?: any[];
+    exercicios_a_subtrair?: any[];
+    exercicios_a_substituir?: Array<{ de: any; para: any }>;
+  };
+}) {
+  const { userEmail, reply, model, data } = args;
+  if (!userEmail) return; // sem email, não persiste
+
+  const day = todayKey();
+  const rootRef = doc(db, "chatfit", userEmail, "exerciciosDoDia", day);
+  const opsCol = collection(db, "chatfit", userEmail, "exerciciosDoDia", day, "ops");
+
+  // Doc resumo do dia (metadados)
+  await setDoc(
+    rootRef,
+    {
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastReply: reply ?? "",
+      model,
+      source: "agent",
+      hasOps: true,
+    },
+    { merge: true }
   );
-  const last6 = filtered.slice(-6);
 
-  return [systemMsg, ...last6];
-}
-
-/** Executa o agente de exercícios. Não persiste; retorna em `data`. */
-export async function runExerciseAgent(opts: {
-  messages: Array<{ role: "user" | "assistant"; content: string }>;
-  ctx?: AgentContext;
-  openAIApiKey: string;
-  model?: string; // default: gpt-4o
-}): Promise<AgentResult> {
-  const { messages, openAIApiKey, model = "gpt-4o" } = opts;
-
-  const payload = {
-    model,
-    temperature: 0.2,
-    top_p: 0.95,
-    max_tokens: 800,
-    response_format: { type: "json_object" as const },
-    messages: buildExerciseMessages(messages),
+  // Grava eventos individuais (append-only)
+  const writeOp = async (type: "add" | "remove" | "sub" | "swap", payload: any) => {
+    const evRef = doc(opsCol, newId());
+    await setDoc(evRef, {
+      type,
+      payload,
+      ts: Date.now(),
+      source: "agent",
+      model,
+    });
   };
 
-  try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${openAIApiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      return { domain: "exercise", reply: `Falha na LLM (exercise): ${errText}`, data: {} };
-    }
-
-    const data = await resp.json();
-    const content = String(data?.choices?.[0]?.message?.content || "");
-    const parsed = parseExercisesFromLLM(content);
-
-    return {
-      domain: "exercise",
-      reply: parsed.reply || "Entendido! Registrei seus exercícios.",
-      data: parsed,
-    };
-  } catch (e: any) {
-    return {
-      domain: "exercise",
-      reply: `Erro de comunicação com a LLM: ${e?.message || "desconhecido"}`,
-      data: {},
-    };
+  for (const it of data.exercicios ?? []) {
+    await writeOp("add", it);
   }
+  for (const it of data.exercicios_a_excluir ?? []) {
+    await writeOp("remove", it);
+  }
+  for (const it of data.exercicios_a_subtrair ?? []) {
+    await writeOp("sub", it);
+  }
+  for (const it of data.exercicios_a_substituir ?? []) {
+    await writeOp("swap", it);
+  }
+}
+
+export async function runExerciseAgent(args: {
+  messages: Array<{ role: "user" | "assistant" | "system"; content: any }>;
+  ctx: AgentContext;
+  openAIApiKey: string;
+  model: string;
+}): Promise<AgentResult> {
+  const { messages, ctx, openAIApiKey, model } = args;
+
+  const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  const userText = typeof lastUser === "string" ? lastUser : "";
+
+  const { text } = await openAIChatCaller({
+    apiKey: openAIApiKey,
+    model,
+    system: EXERCISE_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userText || "Registrar exercícios" }],
+    // não enviamos temperature para evitar erro de modelos que não suportam custom
+    forceJson: true,
+  });
+
+  const parsed = parseJsonLoose(text);
+  const reply = parsed?.reply || "Entendido! Registrei seus exercícios.";
+
+  // >>> Persistência no Firestore (subcoleção ops + doc do dia)
+  try {
+    await persistExerciseOps({
+      userEmail: ctx?.userEmail,
+      reply,
+      model,
+      data: {
+        exercicios: parsed?.exercicios,
+        exercicios_a_excluir: parsed?.exercicios_a_excluir,
+        exercicios_a_subtrair: parsed?.exercicios_a_subtrair,
+        exercicios_a_substituir: parsed?.exercicios_a_substituir,
+      },
+    });
+  } catch (err) {
+    console.error("[exercise.persist] erro:", err);
+    // segue sem quebrar a resposta ao usuário
+  }
+
+  return {
+    domain: "exercise",
+    reply,
+    data: parsed,
+  };
 }

@@ -1,87 +1,118 @@
 // src/ai/clients/openaiCaller.ts
-type ChatMsg = { role: "system" | "user" | "assistant" | "tool"; content: string; name?: string };
+type Role = "system" | "user" | "assistant" | "tool";
+type ChatMsg =
+  | { role: Role; content: string; name?: string }
+  | {
+      role: Role;
+      content: Array<
+        | { type: "text"; text: string }
+        | { type: "image_url"; image_url: { url: string } }
+      >;
+      name?: string;
+    };
 
 type ToolDef = {
   type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters: any; // JSON Schema
-  };
+  function: { name: string; description?: string; parameters: any };
 };
 
 type CallerArgs = {
   apiKey: string;
   model: string;
-  temperature?: number;
+  temperature?: number;       // agora é opcional; omitimos p/ modelos que não suportam custom
+  max_tokens?: number;
+  system?: string;
   messages: ChatMsg[];
-  response_format?: { type: "json_object" } | { type: "text" };
+  forceJson?: boolean;        // response_format: { type: "json_object" }
   tools?: ToolDef[];
-  tool_choice?: "none" | "auto" | { type: "function"; function: { name: string } };
+  tool_choice?: "auto" | { type: "function"; function: { name: string } };
+  baseUrl?: string;
 };
 
-function parseJsonLoose(s: string) {
-  const trimmed = (s || "").trim().replace(/^```json\s*|\s*```$/g, "");
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      try { return JSON.parse(trimmed.slice(start, end + 1)); } catch {}
-    }
-    return undefined;
-  }
+function stripCodeFences(s: string) {
+  return String(s || "")
+    .replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, (_m, p1) => (p1 || "").trim())
+    .trim();
 }
 
-export async function openAIChatCaller(args: CallerArgs): Promise<{
+function parseJsonLoose(s: string) {
+  const txt = stripCodeFences(s);
+  try {
+    if (/^\s*[{[]/.test(txt)) return JSON.parse(txt);
+  } catch {}
+  return null;
+}
+
+// Alguns modelos (ex.: "gpt-5") não aceitam temperature != 1.
+// Nesses casos, melhor OMITIR o campo.
+function supportsCustomTemperature(model: string): boolean {
+  const m = (model || "").toLowerCase().trim();
+  // ajuste aqui se você usar outros modelos com a mesma restrição
+  if (m.startsWith("gpt-5")) return false;
+  return true;
+}
+
+export async function openAIChatCaller({
+  apiKey,
+  model,
+  temperature,
+  max_tokens,
+  system,
+  messages,
+  forceJson,
+  tools,
+  tool_choice,
+  baseUrl,
+}: CallerArgs): Promise<{
   text: string;
-  json?: any;
-  toolCall?: { name: string; arguments: string };
+  json: any | null;
+  toolCall?: { name: string; arguments: string } | undefined;
   raw: any;
 }> {
-  const { apiKey, model, temperature = 0.2, messages, response_format, tools, tool_choice } = args;
+  const url = `${baseUrl ?? "https://api.openai.com"}/v1/chat/completions`;
+  const msgs: any[] = [];
 
-  const body: any = {
-    model,
-    temperature,
-    messages,
-  };
-  if (response_format) body.response_format = response_format;
+  if (system) msgs.push({ role: "system", content: system });
+  for (const m of messages) msgs.push(m);
+
+  const body: any = { model, messages: msgs };
+
+  // Só envia temperature se explicitamente pedido e suportado
+  if (typeof temperature === "number" && supportsCustomTemperature(model)) {
+    body.temperature = temperature;
+  }
+
+  if (typeof max_tokens === "number") body.max_tokens = max_tokens;
+  if (forceJson) body.response_format = { type: "json_object" };
   if (tools?.length) body.tools = tools;
   if (tool_choice) body.tool_choice = tool_choice;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const errTxt = await res.text().catch(() => "");
-    throw new Error(`[openAIChatCaller] ${res.status} ${res.statusText} ${errTxt}`);
+    throw new Error(`OpenAI ${res.status}: ${errTxt || res.statusText}`);
   }
 
   const data = await res.json();
   const choice = data?.choices?.[0];
-  const msg = choice?.message ?? {};
-  const content = typeof msg.content === "string" ? msg.content : (Array.isArray(msg.content) ? msg.content.join("") : "");
+  const message = choice?.message ?? {};
+  const content: string = typeof message.content === "string" ? message.content : "";
 
-  // Se for tool_call, devolvemos os argumentos crus (string JSON)
-  const toolCall = Array.isArray(msg.tool_calls) && msg.tool_calls[0]?.type === "function"
-    ? {
-        name: msg.tool_calls[0].function?.name as string,
-        arguments: String(msg.tool_calls[0].function?.arguments ?? ""),
-      }
-    : undefined;
+  let toolCall: { name: string; arguments: string } | undefined = undefined;
+  const firstTool = message?.tool_calls?.[0]?.function;
+  if (firstTool?.name) {
+    toolCall = { name: firstTool.name, arguments: String(firstTool.arguments ?? "") };
+  }
 
-  // Tenta extrair JSON do próprio content (caso não use tool)
-  const j = toolCall ? undefined : parseJsonLoose(content);
+  const j = toolCall ? null : parseJsonLoose(content);
 
-  return {
-    text: content || "",
-    json: j,
-    toolCall,
-    raw: data,
-  };
+  return { text: content || "", json: j, toolCall, raw: data };
 }

@@ -1,4 +1,6 @@
-import { AgentContext, AgentResult, LLMCaller } from "./types";
+import { AgentContext, AgentResult } from "./types";
+import { openAIChatCaller } from "@/ai/clients/openaiCaller";
+import { RECIPE_SYSTEM_PROMPT } from "@/ai/prompts/recipeLogger";
 
 function parseJsonLoose(raw: string): any | null {
   if (!raw) return null;
@@ -6,86 +8,36 @@ function parseJsonLoose(raw: string): any | null {
   txt = txt.replace(/```(?:json)?\s*([\s\S]*?)```/gi, (_m, p1) => (p1 || "").trim());
   try {
     if (/^\s*[{[]/.test(txt)) return JSON.parse(txt);
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   return null;
 }
 
-/**
- * Agente de receitas.
- * - Gera 1–3 receitas simples baseadas no texto do usuário (ingredientes alvo, preferência, restrições).
- * - Retorna **apenas JSON** quando a LLM está disponível; caso contrário, um placeholder.
- */
-export async function runRecipesAgent(
-  text: string,
-  ctx: AgentContext,
-  llm?: LLMCaller
-): Promise<AgentResult> {
-  if (!llm) {
-    return {
-      domain: "recipes",
-      reply:
-        "Me diga ingredientes que você tem em casa ou o prato desejado que eu te mando 1–3 receitas fáceis.",
-      data: { hint: "Ex.: 'quero receita com frango e arroz', 'receita low-carb para jantar'." },
-    };
+export async function runRecipesAgent(args: {
+  messages: Array<{ role: "user" | "assistant" | "system"; content: any }>;
+  ctx: AgentContext;
+  openAIApiKey: string;
+  model: string;
+}): Promise<AgentResult> {
+  const { messages, openAIApiKey, model } = args;
+  const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  const userText = typeof lastUser === "string" ? lastUser : "";
+
+  const { text } = await openAIChatCaller({
+    apiKey: openAIApiKey,
+    model,
+    system: RECIPE_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userText || "Quero receitas rápidas" }],
+    forceJson: true,
+  });
+
+  const obj = parseJsonLoose(text);
+  if (obj) {
+    return { domain: "recipes", reply: obj.reply || "Aqui estão as receitas.", data: obj };
   }
-
-  const system = `
-Você é um chef prático. Retorne **APENAS JSON** no formato:
-
-{
-  "reply": "frase curta",
-  "receitas": [
-    {
-      "titulo": "nome",
-      "rendimento": "2 porções",
-      "tempo_preparo_min": 0,
-      "ingredientes": [ "item x", "item y", "..." ],
-      "modo_de_preparo": [ "passo 1", "passo 2", "..." ],
-      "macros_estimados": { "kcal": 0, "proteina_g": 0, "carbo_g": 0, "gordura_g": 0 }
-    }
-  ],
-  "observacoes": ["dicas rápidas, substituições"]
-}
-
-Regras:
-- Português do Brasil.
-- Ingredientes acessíveis.
-- Evite doces ultraprocessados por padrão.
-- Não use markdown. Só JSON.
-`.trim();
-
-  const user =
-    `Pedido de receita: "${(text || "").trim()}"` +
-    (ctx?.locale ? ` | locale=${ctx.locale}` : "");
-
-  try {
-    const { content } = await llm({
-      system,
-      messages: [{ role: "user", content: user }],
-      json: false,
-      model: "gpt-4o-mini",
-      temperature: 0.3,
-      max_tokens: 900,
-    });
-
-    const obj = parseJsonLoose(content);
-    if (obj && typeof obj === "object") {
-      return {
-        domain: "recipes",
-        reply: obj.reply || "Aqui vão algumas receitas para você.",
-        data: obj,
-      };
-    }
-  } catch {
-    /* fallback abaixo */
-  }
-
   return {
     domain: "recipes",
     reply:
-      "Posso sugerir receitas — diga os ingredientes disponíveis, tempo que você tem e se há restrições.",
+      "Posso sugerir receitas — diga ingredientes disponíveis, tempo e restrições (sem lactose/glúten etc.).",
     data: null,
   };
 }

@@ -2,116 +2,107 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { getAuth } from "firebase-admin/auth";
-
 import { routeIntent } from "@/ai/agents/maestro";
 import type { AgentContext } from "@/ai/agents/types";
-import { openAIChatCaller } from "@/ai/clients/openaiCaller";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Garante que é um array de mensagens no formato { role, content } */
+function tryJsonParse<T = any>(s: any): T | null {
+  if (s == null) return null;
+  if (typeof s === "object") return s as T;
+  if (typeof s !== "string") return null;
+  const txt = s.trim();
+  if (!txt) return null;
+  try { return JSON.parse(txt) as T; } catch { return null; }
+}
+
 function normalizeMessages(raw: any): Array<{ role: "user" | "assistant" | "system"; content: any }> {
-  if (!raw) return [];
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((m) => m && typeof m === "object")
-    .map((m) => {
-      const role = (m.role === "user" || m.role === "assistant" || m.role === "system") ? m.role : "user";
-      // Aceita tanto string quanto { text }
-      let content = m.content;
-      if (content && typeof content === "object" && "text" in content) content = String(content.text);
-      if (typeof content !== "string") content = String(content ?? "");
-      return { role, content };
-    });
-}
+  let data = raw;
+  const parsed = tryJsonParse<any>(raw);
+  if (parsed) data = parsed;
 
-/** Extrai último texto do usuário (para heurística, se precisar) */
-function extractLastUserText(messages: any[]): string {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m?.role === "user") {
-      if (typeof m.content === "string") return m.content;
-      if (m?.content?.text) return String(m.content.text);
-    }
+  if (Array.isArray(data)) {
+    return data
+      .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"))
+      .map((m) => ({ role: m.role, content: m.content ?? "" }));
   }
-  return "";
-}
 
-/** Tenta identificar o e-mail a partir do ID token (Authorization: Bearer <token>) */
-async function getUserEmailFromAuthHeader(req: NextRequest): Promise<string | null> {
-  const authHeader = req.headers.get("authorization") || req.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return null;
-  const token = authHeader.slice(7).trim();
-  try {
-    const decoded = await getAuth().verifyIdToken(token);
-    return decoded?.email ?? null;
-  } catch {
-    return null;
+  if (data && Array.isArray((data as any).messages)) {
+    return (data as any).messages
+      .filter((m: any) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"))
+      .map((m: any) => ({ role: m.role, content: m.content ?? "" }));
   }
+
+  return [];
 }
 
 export async function POST(req: NextRequest) {
   try {
-    let messagesRaw: any = null;
-    let imageBase64: string | undefined;
-
-    // 1) Aceita multipart/form-data (imagem opcional)
-    if (req.headers.get("content-type")?.includes("multipart/form-data")) {
-      const form = await req.formData();
-      const m = form.get("messages");
-      if (typeof m === "string") {
-        try { messagesRaw = JSON.parse(m); } catch { messagesRaw = []; }
-      } else if (Array.isArray(m)) {
-        messagesRaw = m;
-      }
-
-      const image: any = form.get("image");
-      if (image && typeof image === "object" && "arrayBuffer" in image) {
-        const buf = Buffer.from(await image.arrayBuffer());
-        if (buf.length > 5 * 1024 * 1024) {
-          return NextResponse.json({ ok: false, error: "Imagem muito grande (>5MB)." }, { status: 413 });
-        }
-        const contentType = (image.type as string) || "image/jpeg";
-        imageBase64 = `data:${contentType};base64,${buf.toString("base64")}`;
-      } else if (typeof image === "string" && image.startsWith("data:image/")) {
-        // string base64 direta
-        const approxSize = Math.floor((image.length * 3) / 4);
-        if (approxSize > 5 * 1024 * 1024) {
-          return NextResponse.json({ ok: false, error: "Imagem muito grande (>5MB)." }, { status: 413 });
-        }
-        imageBase64 = image;
-      }
-    } else {
-      // 2) Aceita application/json
-      const body = await req.json().catch(() => ({}));
-      messagesRaw = body?.messages ?? null;
-      if (typeof body?.imageBase64 === "string") imageBase64 = body.imageBase64;
+    const openAIApiKey = process.env.OPENAI_API_KEY;
+    if (!openAIApiKey) {
+      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY ausente no servidor." }, { status: 500 });
     }
 
-    const messages = normalizeMessages(messagesRaw);
+    const ctype = (req.headers.get("content-type") || "").toLowerCase();
 
-    // Se ainda não vieram mensagens válidas, devolve 400
+    let messages: Array<{ role: "user" | "assistant" | "system"; content: any }> = [];
+    let imageBase64: string | undefined;
+    let body: any = {};
+
+    if (ctype.includes("multipart/form-data")) {
+      const form = await req.formData();
+      const messagesField = form.get("messages");
+      imageBase64 = typeof form.get("imageBase64") === "string" ? (form.get("imageBase64") as string) : undefined;
+      messages = normalizeMessages(messagesField);
+      // tentamos também extrair userEmail do form (se existir)
+      const emailField = form.get("userEmail");
+      if (typeof emailField === "string") body.userEmail = emailField;
+    } else if (ctype.includes("application/json")) {
+      try { body = await req.json(); }
+      catch {
+        const txt = await req.text().catch(() => "");
+        body = tryJsonParse(txt) ?? {};
+      }
+      imageBase64 = typeof body?.imageBase64 === "string" ? body.imageBase64 : undefined;
+      messages = normalizeMessages(body);
+      if (messages.length === 0) messages = normalizeMessages(body?.messages);
+    } else {
+      const txt = await req.text().catch(() => "");
+      const maybeKV = Object.fromEntries(new URLSearchParams(txt));
+      const candidate = maybeKV?.messages ?? txt;
+      messages = normalizeMessages(candidate);
+      if (maybeKV?.userEmail) body.userEmail = maybeKV.userEmail;
+    }
+
     if (!Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "Campo 'messages' ausente ou inválido (esperado array com {role, content})." },
+        {
+          ok: false,
+          error: "Campo 'messages' ausente ou inválido (esperado array de objetos {role, content}).",
+          hint: "Exemplo: { \"messages\": [ { \"role\": \"user\", \"content\": \"texto\" } ] }",
+        },
         { status: 400 }
       );
     }
 
-    // Tenta obter email do token, ou de um campo opcional embutido nas messages
-    const tokenEmail = await getUserEmailFromAuthHeader(req);
-    const inlineEmail =
-      messages.find((m: any) => m?.userEmail)?.userEmail ||
-      messages.find((m: any) => m?.email)?.email ||
-      null;
+    // Contexto do usuário: token OU fallback em dev com userEmail do body
+    const authHeader = req.headers.get("Authorization");
+    let userEmail = (typeof body?.userEmail === "string" && body.userEmail) || "anon@local";
 
-    const userEmail = tokenEmail || inlineEmail || "anon@local";
+    if (authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice("Bearer ".length);
+      try {
+        const decoded = await getAuth().verifyIdToken(token);
+        userEmail = decoded?.email || userEmail;
+      } catch {
+        // segue com fallback/body
+      }
+    }
 
     const ctx: AgentContext = {
       userEmail,
-      hasImage: Boolean(imageBase64),
+      hasImage: !!imageBase64,
       imageBase64,
       nowISO: new Date().toISOString(),
       locale: "pt-BR",
@@ -120,21 +111,22 @@ export async function POST(req: NextRequest) {
     const result = await routeIntent({
       messages,
       ctx,
-      openAIApiKey: process.env.OPENAI_API_KEY || "",
-      caller: openAIChatCaller,
+      openAIApiKey,
+      modelFood: "gpt-5",
+      modelExercise: "gpt-5",
+      modelDiet: "gpt-5",
+      modelRecipes: "gpt-5",
+      modelShopping: "gpt-5",
+      routerModel: "gpt-5",
     });
 
     return NextResponse.json(
-      {
-        ok: true,
-        domain: result.domain,
-        reply: result.reply || "",
-        data: result.data || null,
-      },
+      { ok: true, domain: result.domain, reply: result.reply || "", data: result.data ?? null },
       { status: 200 }
     );
   } catch (err: any) {
-    console.error("[/api/agent] Erro:", err);
-    return NextResponse.json({ ok: false, error: err?.message || "Erro inesperado." }, { status: 500 });
+    console.error("[/api/agent] Erro:", err?.stack || err?.message || err);
+    const msg = typeof err?.message === "string" ? err.message : "Erro inesperado.";
+    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
   }
 }
